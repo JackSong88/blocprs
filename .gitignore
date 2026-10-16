@@ -1,0 +1,28 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Generated package files
+build/
+dist/
+*.egg-info/
+
+# Local data and generated outputs; keep source tables and examples elsewhere
+/data/
+/outputs/
+/results/
+/figures/
+/log/
+/logs/
+/tmp/
+slurm-*.out
+
+# Local credentials and editor metadata
+.env
+.env.*
+.DS_Store
