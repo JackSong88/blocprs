@@ -1,35 +1,41 @@
-"""Prepare windowed PRS data for model fitting and prediction.
+"""Window-level polygenic scores and training-derived standardization.
 
-Window scores have shape (participants, windows, sources).
-Data are processed in participant blocks to limit RAM use.
-Inputs must already be harmonized and in the same participant order.
-Training means and SDs are reused for validation and prediction.
+Scores are organized by participant, genomic window and source.
+Blockwise processing limits memory use during fitting and prediction.
+Inputs must be harmonized and aligned by participant before use;
+validation and prediction retain the training means and SDs.
 """
 
 from dataclasses import dataclass
 from numbers import Integral
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 # Check that names are unique and nonempty, keeping their supplied order.
 def _names(values, size, label):
     if isinstance(values, (str, bytes)):
         raise ValueError(f"{label} must be a sequence of names, not one string.")
+
     values = tuple(values)
     if (len(values) != size
         or any(not isinstance(v, str) or not v.strip() or v != v.strip()
                or any(c in v for c in "\t\n\r") for v in values)
         or len(set(values)) != size):
         raise ValueError(f"{label} must contain {size} unique, nonempty strings in array order.")
+
     return values
 
 
 # Check numeric type and shape without copying existing score arrays.
 def _numeric(values, ndim, label):
     array = np.asanyarray(values)
+
     if np.ma.isMaskedArray(array) or array.ndim != ndim or array.dtype.kind not in "biuf":
         raise ValueError(f"{label} must be a {ndim}-dimensional ordinary real numeric array.")
+
     return array
 
 
@@ -37,6 +43,7 @@ def _numeric(values, ndim, label):
 def _block_size(value):
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
         raise ValueError("block_size must be a positive integer.")
+
     return int(value)
 
 
@@ -44,16 +51,18 @@ def _block_size(value):
 def _float32(values, label):
     with np.errstate(over="ignore", invalid="ignore"):
         result = np.array(values, dtype=np.float32, copy=True)
+
     if not np.isfinite(result).all():
         raise ValueError(f"{label} must be finite and representable as float32.")
+
     return result
 
 
 class PRSData:
-    """Store window scores, optional phenotypes, covariates and participant IDs.
+    """Aligned window-level PRSs, phenotypes, covariates and participant IDs.
 
     Scores have shape (participants, windows, sources); covariates have shape
-    (participants, covariates), and y has one value per participant.
+    (participants, covariates). Optional y contains one phenotype per participant.
     Inputs must already be harmonized and in matching participant order.
     Names retain the supplied order. IDs are checked, not used to align arrays.
     Existing arrays are used directly; do not change them during fitting or
@@ -67,19 +76,24 @@ class PRSData:
         # Keep scores and their source/window names in the supplied order.
         self.window_scores = _numeric(window_scores, 3, "window_scores")
         self.n_samples, self.n_windows, self.n_sources = self.window_scores.shape
+
         if min(self.window_scores.shape) < 1:
             raise ValueError("window_scores must contain participants, windows, and sources.")
+
         self.source_names = _names(source_names, self.n_sources, "source_names")
         self.window_names = _names(window_names, self.n_windows, "window_names")
 
         self.y = None if y is None else _numeric(y, 1, "y")
+
         if self.y is not None and self.y.shape != (self.n_samples,):
             raise ValueError("y must contain one outcome per participant.")
 
         self.covariates = (np.empty((self.n_samples, 0), dtype=np.float32) if covariates is None
                            else _numeric(covariates, 2, "covariates"))
+
         if self.covariates.shape[0] != self.n_samples:
             raise ValueError("covariates must contain one row per participant.")
+
         self.n_covariates = self.covariates.shape[1]
         if covariate_names is None:
             covariate_names = tuple(f"covariate_{j}" for j in range(self.n_covariates))
@@ -89,6 +103,7 @@ class PRSData:
         self.sample_ids = None
         if sample_ids is not None:
             ids = np.asanyarray(sample_ids)
+
             if (ids.ndim not in (1, 2) or ids.shape[0] != self.n_samples
                 or (ids.ndim == 2 and ids.shape[1] == 0)):
                 raise ValueError("sample_ids must have N rows and at least one ID field.")
@@ -103,17 +118,67 @@ class PRSData:
                         valid = bool(np.isfinite(value))
                     else:
                         valid = False
+
                     if not valid:
                         raise ValueError("sample_ids contain a missing or unsupported ID value.")
+
                 if key in seen:
                     raise ValueError("sample_ids contain duplicate participant IDs.")
+
                 seen.add(key)
             self.sample_ids = ids
 
 
+# Load one saved split, keeping score and covariate arrays on disk.
+def load_dataset(path, split="train"):
+    """Load a stage-5 dataset as PRSData, without standardizing its values.
+
+    Select the stored 'train', 'test' or 'all' split. Only split=None combines
+    all stored rows; 'all' is the transfer split, not a train/test combination.
+    """
+    path = Path(path)
+    participants = pd.read_csv(path / "participants.tsv", sep="\t", dtype={"FID": str, "IID": str},
+                               float_precision="round_trip")
+    ids = participants[["FID", "IID"]]
+
+    # Missing and duplicate IDs check across all stored splits.
+    if ids.isna().any().any() or any(ids[column].str.strip().eq("").any() for column in ids):
+        raise ValueError("Saved participants contain missing participant IDs.")
+
+    if ids.duplicated().any():
+        raise ValueError("Saved participants contain duplicate FID/IID pairs.")
+
+    features = pd.read_csv(path / "features.tsv", sep="\t", dtype=str)
+    covariate_names = pd.read_csv(path / "covariates.tsv", sep="\t", dtype=str)["covariate"].tolist()
+    windows = features["window"].drop_duplicates().tolist()
+    sources = features["source"].drop_duplicates().tolist()
+
+    # Match the saved array's window-major feature order.
+    if list(zip(features["window"], features["source"])) != [(window, source) for window in windows for source in sources]:
+        raise ValueError("Saved feature names do not describe a complete window-major grid.")
+
+    scores = np.load(path / "scores.npy", mmap_mode="r", allow_pickle=False)
+    covariates = np.load(path / "covariates.npy", mmap_mode="r", allow_pickle=False)
+
+    if scores.shape != (len(participants), len(windows), len(sources)) or covariates.shape != (len(participants), len(covariate_names)):
+        raise ValueError("Saved arrays and their participant/feature names have inconsistent dimensions.")
+
+    rows = np.arange(len(participants)) if split is None else np.flatnonzero(participants["split"].eq(split))
+
+    # Contiguous rows preserve memory-mapped slicing.
+    if len(rows) == 0 or rows[-1] - rows[0] + 1 != len(rows):
+        raise ValueError(f"Split {split!r} must contain a nonempty contiguous block of participants.")
+
+    selection = slice(int(rows[0]), int(rows[-1]) + 1)
+    selected = participants.iloc[selection]
+    return PRSData(scores[selection], sources, windows, y=selected["phenotype"].to_numpy(dtype=float),
+                   covariates=covariates[selection], covariate_names=covariate_names,
+                   sample_ids=selected[["FID", "IID"]].to_numpy())
+
+
 @dataclass
 class Scaler:
-    """Store training means and SDs for standardizing model inputs.
+    """Training means and standard deviations for model standardization.
 
     window_mean: W x K; source_sd: K; cov_mean/cov_sd: C; y_mean/y_sd: scalar.
     W, K and C are the numbers of windows, sources and covariates.
@@ -142,6 +207,7 @@ class Scaler:
         self.source_names = _names(self.source_names, len(self.source_names), "source_names")
         self.window_names = _names(self.window_names, len(self.window_names), "window_names")
         self.covariate_names = _names(self.covariate_names, len(self.covariate_names), "covariate_names")
+
         if not self.source_names or not self.window_names:
             raise ValueError("Scaler requires at least one source and window.")
 
@@ -153,18 +219,23 @@ class Scaler:
         }
         for name, shape in shapes.items():
             value = _float32(getattr(self, name), name)
+
             if value.shape != shape or (name in ("source_sd", "cov_sd") and np.any(value <= 0)):
                 raise ValueError(f"Invalid {name}; expected shape {shape} and positive SD denominators.")
+
             setattr(self, name, value)
 
         for name in ("y_mean", "y_sd"):
             value = _float32(getattr(self, name), name)
+
             if value.ndim != 0:
                 raise ValueError(f"{name} must be a scalar.")
+
             setattr(self, name, float(value))
 
         if self.y_sd <= 0:
             raise ValueError("y_sd must be positive.")
+
         if self.family == "binomial" and (self.y_mean != 0 or self.y_sd != 1):
             raise ValueError("Binomial outcomes must remain unscaled.")
 
@@ -172,8 +243,10 @@ class Scaler:
     @classmethod
     def fit(cls, data, family, block_size=8192):
         block_size = _block_size(block_size)
+
         if family not in ("gaussian", "binomial"):
             raise ValueError("family must be 'gaussian' or 'binomial'.")
+
         if data.y is None:
             raise ValueError("Fitting a scaler requires training outcomes.")
 
@@ -192,6 +265,7 @@ class Scaler:
                 windows = _float32(data.window_scores[rows], "window_scores")
                 covariates = _float32(data.covariates[rows], "covariates")
                 y = _float32(data.y[rows], "y")
+
                 if family == "binomial" and not np.isin(data.y[rows], (0, 1)).all():
                     raise ValueError("Binomial outcomes must be exactly 0 or 1.")
 
@@ -203,7 +277,7 @@ class Scaler:
                     cov_sum += covariates.sum(axis=0, dtype=np.float64)
                     y_sum += float(y.sum(dtype=np.float64))
 
-                # Identify columns with at most two distinct values before rounding.
+                    # Identify columns with at most two distinct values before rounding.
                     for j in range(data.n_covariates + 1):
                         if len(distinct[j]) <= 2:
                             raw = data.y[rows] if j == data.n_covariates else data.covariates[rows, j]
@@ -247,6 +321,7 @@ class Scaler:
     # Standardize windows using their training means and genome-wide source SDs.
     def transform_windows(self, values):
         result = _float32(values, "window_scores")
+
         if result.ndim != 3 or result.shape[1:] != self.window_mean.shape:
             raise ValueError("Window-score block does not match the fitted layout.")
 
@@ -256,11 +331,13 @@ class Scaler:
 
         if not np.isfinite(result).all():
             raise ValueError("Nonfinite standardized window scores.")
+
         return result
 
     # Standardize covariates using their training means and SDs.
     def transform_covariates(self, values):
         result = _float32(values, "covariates")
+
         if result.ndim != 2 or result.shape[1] != len(self.covariate_names):
             raise ValueError("Covariate block does not match the fitted layout.")
 
@@ -269,13 +346,16 @@ class Scaler:
 
         if not np.isfinite(result).all():
             raise ValueError("Nonfinite standardized covariates.")
+
         return result
 
     # Standardize y with training values; binary phenotypes remain unchanged.
     def transform_outcome(self, values):
         result = _float32(values, "y")
+
         if result.ndim != 1:
             raise ValueError("Outcome block must be a vector.")
+
         if self.family == "binomial" and not np.isin(values, (0, 1)).all():
             raise ValueError("Binomial outcomes must be exactly 0 or 1.")
 
@@ -284,11 +364,12 @@ class Scaler:
 
         if not np.isfinite(result).all():
             raise ValueError("Nonfinite standardized outcomes.")
+
         return result
 
 
 class Design:
-    """Build model inputs in participant blocks to limit RAM use.
+    """Blockwise construction of the BLocPRS design matrix.
 
     Each block contains an intercept, covariates, genome-wide source scores
     and centered window scores: [1, C, S_global, Z]. Training means and SDs
@@ -314,11 +395,14 @@ class Design:
             self.n_samples = max(0, stop - start)
         else:
             rows = np.asarray(rows)
+
             if rows.dtype.kind == "b" and rows.shape == (data.n_samples,):
                 rows = np.flatnonzero(rows)
+
             if (rows.ndim != 1 or rows.dtype.kind not in "iu" or np.any(rows < 0)
                 or np.any(rows >= data.n_samples) or len(np.unique(rows)) != len(rows)):
                 raise ValueError("rows must be unique, in-range integer indices or an N-vector mask.")
+
             self.rows = rows.astype(np.int64, copy=True)
             self.n_samples = len(rows)
 
@@ -359,6 +443,7 @@ class Design:
 
             y = (None if not include_outcome or data.y is None
                  else self.scaler.transform_outcome(data.y[rows]).astype(np.float64))
+
             if not np.isfinite(X).all():
                 raise ValueError("Nonfinite model design.")
 
@@ -372,6 +457,7 @@ class Design:
         result = np.empty(self.n_samples, dtype=np.float64)
         for start, stop, rows in self._blocks():
             result[start:stop] = self.scaler.transform_outcome(self.data.y[rows])
+
         return result
 
     # Collect selected transformed N x C covariates without reading PRS.
@@ -379,4 +465,5 @@ class Design:
         result = np.empty((self.n_samples, self.n_covariates), dtype=np.float64)
         for start, stop, rows in self._blocks():
             result[start:stop] = self.scaler.transform_covariates(self.data.covariates[rows])
+
         return result

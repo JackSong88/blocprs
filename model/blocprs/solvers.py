@@ -1,8 +1,8 @@
-"""Fit continuous and binary models in participant blocks to limit RAM use.
+"""Penalized linear and logistic regression for BLocPRS.
 
-Model inputs contain the intercept, covariates, genome-wide scores, and
-regional adjustments. Only regional coefficients receive a ridge penalty.
-Each fit uses all supplied participants.
+Ridge regularization acts on regional coefficients; the intercept, covariate
+effects and genome-wide source coefficients remain unpenalized. Model inputs
+are processed in participant blocks to limit memory use.
 """
 
 from dataclasses import dataclass
@@ -14,6 +14,7 @@ from scipy.optimize import minimize
 from scipy.special import expit, logit
 
 
+# Logistic optimizer iteration limits and stopping tolerances.
 BINARY_OPTIONS = {"maxiter": 1000, "maxls": 50, "ftol": 1e-9, "gtol": 1e-5}
 
 
@@ -41,12 +42,14 @@ class GaussianStatistics:
 # Build the ridge penalty vector for regional coefficients only.
 def _penalty(design, lambda_, n_unpenalized):
     p = design.n_features
+
     if (isinstance(n_unpenalized, (bool, np.bool_))
         or not isinstance(n_unpenalized, (int, np.integer))
         or not 1 <= n_unpenalized <= p):
         raise ValueError("Invalid number of unpenalized coefficients.")
 
     lambda_ = float(lambda_)
+
     if not np.isfinite(lambda_) or lambda_ < 0:
         raise ValueError("Regional penalty must be finite and nonnegative.")
 
@@ -66,6 +69,7 @@ def _blocks(design):
             raise ValueError("Fitting requires outcomes.")
 
         X, y = np.asarray(X, dtype=np.float64), np.asarray(y, dtype=np.float64)
+
         if X.ndim != 2 or X.shape[1] != p or y.shape != (len(X),) or len(X) == 0:
             raise ValueError("Invalid design block dimensions.")
 
@@ -86,8 +90,10 @@ def continuous_statistics(design):
 
         # Update one triangle in place to avoid a p x p temporary per block.
         updated = dsyrk(1.0, np.asfortranarray(X.T), beta=1.0, c=gram, trans=0, lower=1, overwrite_c=1)
+
         if not np.shares_memory(updated, gram):
             raise RuntimeError("BLAS did not update the preallocated Gram matrix in place.")
+
         rhs += X.T @ y
 
     # Mirror the accumulated lower triangle before solving the full system.
@@ -96,8 +102,10 @@ def continuous_statistics(design):
 
     gram /= n
     rhs /= n
+
     if not np.isfinite(gram).all() or not np.isfinite(rhs).all():
         raise FloatingPointError("Nonfinite Gaussian cross-products.")
+
     return GaussianStatistics(gram, rhs, n, id(design))
 
 
@@ -109,6 +117,7 @@ def _objective_gradient(design, coef, penalty, family):
 
     for X, y in _blocks(design):
         linear_predictor = X @ coef
+
         if family == "gaussian":
             residual = linear_predictor - y
             loss += 0.5 * float(residual @ residual)
@@ -122,8 +131,10 @@ def _objective_gradient(design, coef, penalty, family):
     # Average the data loss; add lambda / 2 * ||eta||^2 only once.
     loss = loss / n + 0.5 * float(np.sum(penalty * coef * coef))
     gradient = gradient / n + penalty * coef
+
     if not np.isfinite(loss) or not np.isfinite(gradient).all():
         raise FloatingPointError("Nonfinite objective or gradient.")
+
     return float(loss), gradient
 
 
@@ -131,6 +142,7 @@ def _objective_gradient(design, coef, penalty, family):
 def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None):
     if family not in ("gaussian", "binomial"):
         raise ValueError("family must be 'gaussian' or 'binomial'.")
+
     n, p = design.n_samples, design.n_features
     penalty = _penalty(design, lambda_, n_unpenalized)
 
@@ -139,12 +151,10 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None):
             raise ValueError("Gaussian fitting does not use initial coefficients.")
 
         stats = continuous_statistics(design) if statistics is None else statistics
-        if (not isinstance(stats, GaussianStatistics)
-            or stats.n_samples != n
-            or stats.design_id != id(design)
-            or stats.gram.shape != (p, p)
-            or stats.rhs.shape != (p,)
-            or not np.isfinite(stats.gram).all()
+
+        if (not isinstance(stats, GaussianStatistics) or stats.n_samples != n
+            or stats.design_id != id(design) or stats.gram.shape != (p, p)
+            or stats.rhs.shape != (p,) or not np.isfinite(stats.gram).all()
             or not np.isfinite(stats.rhs).all()):
             raise ValueError("Gaussian statistics do not match the design.")
 
@@ -152,6 +162,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None):
         system = stats.gram.copy(order="F")
         system.flat[::p + 1] += penalty
         message = "numpy.linalg.solve"
+
         try:
             coef = np.linalg.solve(system, stats.rhs)
         except np.linalg.LinAlgError:
@@ -167,13 +178,16 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None):
 
         objective, gradient = _objective_gradient(design, coef, penalty, family)
         tolerance = 1e-7 * max(1.0, float(np.max(np.abs(stats.rhs))))
+
         if float(np.max(np.abs(gradient))) > tolerance:
             raise RuntimeError("Gaussian solution failed the penalized normal-equation check.")
+
         return FitResult(coef, objective, True, 1, message)
 
     if statistics is not None:
         raise ValueError("Gaussian cross-products cannot be used for logistic fitting.")
 
+    # Count cases across all blocks before initializing the logistic intercept.
     cases = 0
     for _, y in _blocks(design):
         if not np.isin(y, [0.0, 1.0]).all():
@@ -185,17 +199,23 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None):
     # Initialize the intercept from prevalence, clipping to keep the logit finite.
     start = np.zeros(p, dtype=np.float64)
     start[0] = float(logit(np.clip(cases / n, 1e-6, 1.0 - 1e-6)))
+
     if initial is not None:
         initial = np.asarray(initial, dtype=np.float64)
+
         if initial.shape != (p,) or not np.isfinite(initial).all():
             raise ValueError("Invalid logistic warm-start coefficients.")
+
         start = initial.copy()
 
+    # Supply the mean logistic loss and its analytic gradient to L-BFGS-B.
     optimum = minimize(lambda coef: _objective_gradient(design, coef, penalty, family), start,
                        jac=True, method="L-BFGS-B", options=dict(BINARY_OPTIONS))
 
     coef = np.asarray(optimum.x, dtype=np.float64)
+
     if not optimum.success or not np.isfinite(coef).all():
         raise RuntimeError(f"Logistic fit did not converge: {optimum.message}")
+
     objective, _ = _objective_gradient(design, coef, penalty, family)
     return FitResult(coef, objective, True, int(optimum.nit), str(optimum.message))

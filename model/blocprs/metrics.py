@@ -1,12 +1,14 @@
-"""Evaluate how much a fixed genetic score adds beyond covariates.
+"""Covariate-adjusted evaluation of fixed polygenic scores.
 
-Regressions are fitted on the evaluation participants, with and without the
-genetic score. The source and window coefficients that produced it stay fixed.
+Incremental R^2 and covariate-conditioned Nagelkerke R^2 compare regressions
+fitted with and without the PRS on the same evaluation participants.
+Source and regional coefficients remain fixed during evaluation.
 """
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from statsmodels.tools.sm_exceptions import PerfectSeparationError
 
 
 INCREMENTAL_R2_VERSION = "incremental_r2_ols_v1"
@@ -16,16 +18,25 @@ NAGELKERKE_R2_DEFINITION = ("(1-exp(-2*(ll_Logit(y~1+C+genetic_score)-ll_Logit(y
                           "/(1-exp(2*ll_Logit(y~1+C)/n));validation_refit")
 
 
+class NonEstimableError(ValueError):
+    """The evaluation data are valid, but the metric cannot be estimated."""
+
+
 # Check and copy evaluation phenotypes and covariates in the supplied row order.
 def _inputs(y, covariates):
     y = np.asarray(y, dtype=np.float64)
-    if y.ndim != 1 or len(y) < 2 or not np.isfinite(y).all():
-        raise ValueError("Evaluation requires at least two finite outcomes.")
+
+    if y.ndim != 1 or not np.isfinite(y).all():
+        raise ValueError("Evaluation requires a finite phenotype vector.")
 
     covariates = (np.empty((len(y), 0), dtype=np.float64) if covariates is None
                   else np.asarray(covariates, dtype=np.float64))
+
     if covariates.ndim != 2 or covariates.shape[0] != len(y) or not np.isfinite(covariates).all():
-        raise ValueError("Covariates must be finite with one row per outcome.")
+        raise ValueError("Covariates must be finite with one row per participant.")
+
+    if len(y) < 2:
+        raise NonEstimableError("Evaluation requires at least two participants.")
 
     return y.copy(), covariates.copy()
 
@@ -33,8 +44,10 @@ def _inputs(y, covariates):
 # Require one finite genetic score per evaluation participant.
 def _score_vector(genetic_score, y):
     score = np.asarray(genetic_score, dtype=np.float64)
+
     if score.shape != y.shape or not np.isfinite(score).all():
-        raise ValueError("Genetic score must be a finite vector matching the outcomes.")
+        raise ValueError("Genetic score must be a finite vector matching the participants.")
+
     return score
 
 
@@ -49,8 +62,9 @@ class IncrementalR2:
         self.y, covariates = _inputs(y, covariates)
         centered = self.y - self.y.mean()
         self.total_ss = float(centered @ centered)
+
         if not np.isfinite(self.total_ss) or self.total_ss <= 0:
-            raise ValueError("Incremental R^2 requires positive outcome variance.")
+            raise NonEstimableError("Incremental R^2 requires positive phenotype variance.")
 
         self.null_design = np.column_stack((np.ones(len(self.y)), covariates))
         coef = np.linalg.lstsq(self.null_design, self.y, rcond=None)[0]
@@ -60,19 +74,26 @@ class IncrementalR2:
     # Refit OLS with the frozen score and return its incremental R^2.
     def score(self, genetic_score):
         score = _score_vector(genetic_score, self.y)
+
+        # A constant score adds no information beyond the intercept.
+        if np.all(score == score[0]):
+            return 0.0
+
         full_design = np.column_stack((self.null_design, score))
         coef = np.linalg.lstsq(full_design, self.y, rcond=None)[0]
         residual = self.y - full_design @ coef
 
         # Divide the reduction in squared error by total phenotype variation.
         value = float((self.null_ss - residual @ residual) / self.total_ss)
+
         if not np.isfinite(value):
-            raise ValueError("Incremental R^2 is not finite.")
-        return value  # Unclipped incremental R^2.
+            raise NonEstimableError("Incremental R^2 is not finite.")
+
+        return value
 
 
 class NagelkerkeR2:
-    """Nagelkerke R^2 for adding the fixed PRS to a covariate-only logistic model.
+    """Covariate-conditioned Nagelkerke R^2 for a fixed polygenic score.
 
     Both models use the same participants; normalization uses the covariate-only fit.
     """
@@ -80,8 +101,13 @@ class NagelkerkeR2:
     # Fit the covariate-only logistic model and compute the normalization factor.
     def __init__(self, y, covariates=None):
         self.y, covariates = _inputs(y, covariates)
-        if not np.array_equal(np.unique(self.y), [0.0, 1.0]):
-            raise ValueError("Nagelkerke R^2 requires binary outcomes with both classes.")
+        classes = np.unique(self.y)
+
+        if not np.isin(classes, [0.0, 1.0]).all():
+            raise ValueError("Binary phenotypes must be coded as 0 and 1.")
+
+        if len(classes) != 2:
+            raise NonEstimableError("Nagelkerke R^2 requires both cases and controls.")
 
         self.covariates = pd.DataFrame(covariates)
 
@@ -90,31 +116,39 @@ class NagelkerkeR2:
         self.null_ll = self._fit_log_likelihood(self.covariates, "covariate-only")
 
         self.denominator = 1.0 - np.exp(2.0 * self.null_ll / len(self.y))
+
         if not np.isfinite(self.denominator) or self.denominator <= 0:
-            raise ValueError("Nagelkerke normalization is not estimable.")
+            raise NonEstimableError("Nagelkerke normalization is not estimable.")
 
     # Return the logistic log-likelihood only when the fit converges and is finite.
     def _fit_log_likelihood(self, covariates, label):
         try:
             result = sm.Logit(self.y, sm.add_constant(covariates)).fit(disp=0)
-        except Exception as exc:
-            raise ValueError(f"Nagelkerke {label} fit is not estimable: {exc}") from exc
+        except (np.linalg.LinAlgError, PerfectSeparationError, FloatingPointError) as exc:
+            raise NonEstimableError(f"Nagelkerke {label} fit is not estimable: {exc}") from exc
 
-        if (not result.mle_retvals.get("converged", False)
-            or not np.isfinite(result.params).all()
-            or not np.isfinite(result.llf)):
-            raise ValueError(f"Nagelkerke {label} fit did not converge to a finite fit.")
+        finite = np.isfinite(result.params).all() and np.isfinite(result.llf)
+
+        if not result.mle_retvals.get("converged", False) or not finite:
+            raise NonEstimableError(f"Nagelkerke {label} fit did not converge to a finite fit.")
 
         return float(result.llf)
 
     # Refit logistic regression with the frozen score and return Nagelkerke R^2.
     def score(self, genetic_score):
         score = _score_vector(genetic_score, self.y)
+
+        # A constant score adds no information beyond the intercept.
+        if np.all(score == score[0]):
+            return 0.0
+
         full_ll = self._fit_log_likelihood(self.covariates.assign(pred_val=score), "covariate-plus-PRS")
 
         value = (1.0 - np.exp(-2.0 * (full_ll - self.null_ll) / len(self.y))) / self.denominator
+
         if not np.isfinite(value):
-            raise ValueError("Nagelkerke R^2 is not finite.")
+            raise NonEstimableError("Nagelkerke R^2 is not finite.")
+
         return float(value)
 
 

@@ -11,6 +11,7 @@ env/
 build/
 dist/
 *.egg-info/
+.nextflow/
 
 # Local data and generated outputs; keep source tables and examples elsewhere
 /data/
@@ -20,7 +21,9 @@ dist/
 /log/
 /logs/
 /tmp/
+/validation/
 slurm-*.out
+blocprs_*.log
 
 # Local credentials and editor metadata
 .env

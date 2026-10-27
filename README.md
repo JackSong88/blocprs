@@ -1,9 +1,19 @@
 # BLocPRS
 
-**Under construction:** Code and documentation are being prepared for release.
+**Under construction. Dedicated documentation is coming soon.**
 
-BLocPRS is a locus-aware framework for combining polygenic risk scores
-from multiple sources. It learns genome-wide weights and regularized
-regional adjustments, allowing source contributions to vary across the
-genome. Fitted models can be exported as a single set of SNP weights
-for standard PRS scoring.
+Code for BLocPRS, a locus-aware model for combining polygenic risk
+scores through genome-wide source weights and regularized regional
+adjustments.
+
+## Code overview
+
+- `data_preparation/`: source weights, cohort preparation, PRS scoring,
+  genomic windows, and model-ready datasets.
+- `model/`: BLocPRS, comparator models, fitting, and SNP-weight export.
+- `evaluation/`: covariate-adjusted evaluation and bootstrap uncertainty.
+- `tables/`: source panels and genomic window definitions.
+- `setup_environment.sh`: Python environment setup.
+
+Some preprocessing scripts are adapted from
+[MoEPRS](https://github.com/shz9/moe-prs-paper); see `LICENSE`.

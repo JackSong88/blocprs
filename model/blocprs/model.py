@@ -1,4 +1,8 @@
-"""Fit BLocPRS models, generate predictions and save fitted parameters."""
+"""Locus-aware integration of source polygenic scores using BLocPRS.
+
+Genome-wide source coefficients and regularized regional adjustments are
+estimated jointly by linear or logistic regression.
+"""
 
 import json
 import os
@@ -15,12 +19,16 @@ from .solvers import fit as solve
 
 
 class BLocPRS:
-    """Fit global and regional PRS coefficients, penalizing only regional effects.
+    """Joint estimation of genome-wide and regional PRS coefficients.
+
+    Ridge regularization acts on regional adjustments; the intercept,
+    covariate effects and genome-wide source coefficients remain unpenalized.
 
     ``family`` is ``"gaussian"`` or ``"binomial"``. A fixed ``lambda_`` skips
-    CV; otherwise select from ``lambda_grid`` (25 log ladder values from 1e-3 to 1e3).
+    CV; otherwise select from ``lambda_grid`` (25 logarithmically spaced values
+    from 1e-3 to 1e3 by default).
     CV evaluates fixed genetic scores using incremental R^2 for continuous
-    phenotypes or Nagelkerke R^2 for binary phenotypes, not training loss.
+    phenotypes or covariate-conditioned Nagelkerke R^2 for binary phenotypes.
     Means and SDs are computed once on the whole supplied training set and
     reused across CV folds and for prediction.
 
@@ -59,10 +67,10 @@ class BLocPRS:
 
         if self.lambda_ is None:
             selected_lambda, cv_results = select_lambda(data, scaler, self.family, grid,
-                                                        cv_folds=self.cv_folds,
-                                                        cv_max_samples=self.cv_max_samples,
-                                                        random_state=self.random_state,
-                                                        block_size=self.block_size)
+                                                       cv_folds=self.cv_folds,
+                                                       cv_max_samples=self.cv_max_samples,
+                                                       random_state=self.random_state,
+                                                       block_size=self.block_size)
         else:
             selected_lambda, cv_results = float(self.lambda_), []
 
@@ -154,6 +162,7 @@ class BLocPRS:
 
             if not np.isfinite(values).all():
                 raise FloatingPointError("Nonfinite genetic predictions.")
+
             return values
 
         # Manuscript eq:blocprs: ell = alpha_0 + C @ alpha + genetic score.
@@ -168,6 +177,7 @@ class BLocPRS:
 
         if not np.isfinite(values).all():
             raise FloatingPointError("Nonfinite full predictions.")
+
         return values
 
     # Compute the genetic score without covariates, intercept or sigmoid.
@@ -182,16 +192,20 @@ class BLocPRS:
     def predict_proba(self, data):
         if self.family != "binomial":
             raise ValueError("predict_proba requires a binomial model.")
+
         return expit(self.predict_linear(data))
 
     # Evaluate covariate-adjusted R^2; only the evaluation regressions are refitted.
     def score(self, data):
         self._require_fitted()
+
         if data.y is None:
             raise ValueError("Evaluation requires outcomes.")
+
         if data.covariate_names != self.covariate_names_:
             raise ValueError("Evaluation requires the fitted covariate names and order.")
 
+        # Evaluate the frozen genetic score using the shared CV metric.
         metric = NagelkerkeR2 if self.family == "binomial" else IncrementalR2
         return metric(data.y, data.covariates).score(self.predict_prs(data))
 
@@ -226,6 +240,7 @@ class BLocPRS:
 
         # Replace the destination only after the archive has been written.
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+
         try:
             with os.fdopen(fd, "wb") as stream:
 
@@ -235,16 +250,18 @@ class BLocPRS:
                                     source_scale=scaler.source_sd,
                                     covariate_mean=scaler.cov_mean, covariate_scale=scaler.cov_sd,
                                     outcome_mean=np.asarray(scaler.y_mean), outcome_scale=np.asarray(scaler.y_sd))
+
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    # Restore a fitted model from this package's archive, not a legacy pickle.
+    # Restore a fitted model and its saved training parameters.
     @classmethod
     def load(cls, path):
         with np.load(path, allow_pickle=False) as saved:
             metadata = json.loads(str(saved["metadata"].item()))
+
             if (metadata.get("format") != "blocprs-model-v1"
                 or metadata.get("loss_reduction") != "mean"
                 or metadata.get("centering") != "uniform"
@@ -265,8 +282,10 @@ class BLocPRS:
             arrays = {}
             for stored_name, name in archive_names.items():
                 value = saved[stored_name].copy()
+
                 if value.dtype.kind not in "iuf":
                     raise ValueError(f"Saved {name} must be a real numeric array.")
+
                 arrays[name] = value
 
             # Check the restored source/window/covariate order, means and SDs.
@@ -279,14 +298,17 @@ class BLocPRS:
             n_coefficients = 1 + n_covariates + n_sources * (1 + n_windows)
 
             coef = saved["coef"].copy()
+
             if coef.dtype.kind not in "iuf" or coef.shape != (n_coefficients,) or not np.isfinite(coef).all():
                 raise ValueError("Invalid saved coefficients.")
 
             selected_lambda = float(metadata["selected_lambda"])
+
             if not np.isfinite(selected_lambda) or selected_lambda < 0:
                 raise ValueError("Invalid saved penalty.")
 
             model = cls(scaler.family, **metadata["parameters"])
+
             if model.block_size < 1:
                 raise ValueError("Invalid saved block_size.")
 

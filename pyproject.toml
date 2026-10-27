@@ -12,7 +12,10 @@ license = "CC-BY-NC-4.0"
 license-files = ["LICENSE"]
 dependencies = ["numpy", "scipy", "pandas", "scikit-learn", "statsmodels"]
 
+[project.optional-dependencies]
+preparation = ["zstandard", "liftover>=1.3.3"]
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["model"]
 include = ["blocprs", "blocprs.*"]
 namespaces = false
