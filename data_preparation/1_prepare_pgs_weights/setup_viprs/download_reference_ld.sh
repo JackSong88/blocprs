@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 set -euo pipefail
 
 ld_dir="data/viprs_ld"

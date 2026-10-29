@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Prepare CARTaGENE native covariates and cluster assignments."""
 
 import argparse

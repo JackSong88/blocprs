@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Shared phenotype QC and medication corrections used in the cohort scripts."""
 
 from pathlib import Path

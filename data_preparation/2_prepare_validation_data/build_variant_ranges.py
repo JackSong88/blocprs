@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Collect source-weight positions for PLINK --extract range.
 
 Output is a headerless, 1-based inclusive CHR/start/end table, not BED0.

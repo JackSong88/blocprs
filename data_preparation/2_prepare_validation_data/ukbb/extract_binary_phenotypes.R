@@ -1,5 +1,8 @@
 #!/usr/bin/env Rscript
 
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 suppressPackageStartupMessages({
   library(optparse)
   library(bigreadr)

@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Format VIPRS effects as GRCh37 scores, optionally lifting positions to GRCh38."""
 
 import argparse

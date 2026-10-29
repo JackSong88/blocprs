@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 #SBATCH --job-name=blocprs_sex_specific_weights
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G

@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Extract raw SUM scores or projected covariates from pgsc_calc outputs."""
 
 import argparse

@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Prepare the CARTaGENE continuous and binary phenotypes used in the paper.
 
 Clinical exclusions and sex-stratified outlier screening precede splitting.

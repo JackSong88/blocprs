@@ -15,5 +15,6 @@ adjustments.
 - `tables/`: source panels and genomic window definitions.
 - `setup_environment.sh`: Python environment setup.
 
-Some preprocessing scripts are adapted from
-[MoEPRS](https://github.com/shz9/moe-prs-paper); see `LICENSE`.
+Original BLocPRS code is MIT-licensed. Files marked as adapted from
+[MoEPRS](https://github.com/shz9/moe-prs-paper) retain CC BY-NC 4.0 terms
+for the inherited material. See [LICENSE](LICENSE).

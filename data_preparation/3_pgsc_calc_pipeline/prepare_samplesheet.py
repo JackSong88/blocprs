@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Write a pgsc_calc samplesheet from an explicit chromosome filename template."""
 
 import argparse

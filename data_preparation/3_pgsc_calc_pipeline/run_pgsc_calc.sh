@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 #SBATCH --job-name=blocprs_pgsc_calc
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=180G

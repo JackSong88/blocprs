@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Download selected PGS Catalog harmonized weights without changing their contents."""
 
 import argparse

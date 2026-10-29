@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Prepare the UKB continuous phenotypes used in the paper.
 
 Sex-stratified outlier screening is applied to the eligible cohort before

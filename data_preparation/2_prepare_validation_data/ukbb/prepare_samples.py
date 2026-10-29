@@ -1,3 +1,6 @@
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 """Prepare UK Biobank sample IDs and native-PC covariates from tabular data."""
 
 import argparse

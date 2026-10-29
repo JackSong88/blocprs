@@ -8,7 +8,7 @@ version = "0.1.0.dev0"
 description = "BLocPRS research code for locus-aware polygenic score integration."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "CC-BY-NC-4.0"
+license = "MIT"
 license-files = ["LICENSE"]
 dependencies = ["numpy", "scipy", "pandas", "scikit-learn", "statsmodels"]
 

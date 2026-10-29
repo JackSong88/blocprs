@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
+# Modified for BLocPRS.
+
 #SBATCH --job-name=blocprs_ukbb_phenotypes
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
