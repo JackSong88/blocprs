@@ -1,4 +1,4 @@
-# BLocPRS: locus-aware ensembles of polygenic scores provide accurate linear prediction
+# BLocPRS: locus-aware ensembles of polygenic scores provide accurate linear prediction (2026)
 
 **Under construction. Dedicated documentation coming soon!**
 
@@ -30,12 +30,16 @@ variant weights for conventional PRS scoring.
 
 ## Citation
 ```bibtex
-@article{Song2026.10.26.759503,
-  author = {Song, Junyi and Zabad, Shadi and Gravel, Simon and Li, Yue},
-  title = {{BLocPRS}: locus-aware ensembles of polygenic scores provide accurate linear prediction},
-  year = {2026},
-  doi = {10.64898/2026.10.26.759503},
-  journal = {bioRxiv},
-  URL = {https://www.biorxiv.org/content/10.64898/2026.10.26.759503v1}
+@article {Song2026.10.26.759503,
+	author = {Song, Junyi and Zabad, Shadi and Gravel, Simon and Li, Yue},
+	title = {BLocPRS: locus-aware ensembles of polygenic scores provide accurate linear prediction},
+	elocation-id = {2026.10.26.759503},
+	year = {2026},
+	doi = {10.64898/2026.10.26.759503},
+	publisher = {Cold Spring Harbor Laboratory},
+	URL = {https://www.biorxiv.org/content/early/2026/10/30/2026.10.26.759503},
+	eprint = {https://www.biorxiv.org/content/early/2026/10/30/2026.10.26.759503.full.pdf},
+	journal = {bioRxiv}
 }
+
 ```
