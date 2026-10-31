@@ -57,8 +57,8 @@ def _read_cross_mapping(paths, sources, windows, cohort):
                                                f"{cohort}_chr": "chromosome", f"{cohort}_position": "position"})
                 ids = _numeric_column(frame, "window_id_global")
 
-                if np.any((ids < 1) | (ids != np.floor(ids)) | (ids >= 2**53)):
-                    raise ValueError("The crosswalk needs positive, integer window_id_global assignments.")
+                if np.any((ids < 0) | (ids != np.floor(ids)) | (ids >= 2**53)):
+                    raise ValueError("The crosswalk needs nonnegative, integer window_id_global assignments.")
 
                 frame["window"] = [f"w{int(value):04d}" for value in ids]
 
@@ -165,6 +165,7 @@ def export_canonical_snp_weights(model, cross_mapping, *, cohort, genome_build, 
             raise ValueError("A matched effect allele is neither REF nor ALT in the cohort PVAR.")
 
         # beta * dosage(REF) = 2 * beta - beta * dosage(ALT).
+        # Keep the constant as well as flipping the weight, so exported scores retain their level.
         frame["allele_offset"] = np.where(reversed_allele, 2 * frame["weight"], 0.0)
         frame["weight"] = np.where(reversed_allele, -frame["weight"], frame["weight"])
         frame["effect_allele"], frame["other_allele"] = frame["alt"], frame["ref"]

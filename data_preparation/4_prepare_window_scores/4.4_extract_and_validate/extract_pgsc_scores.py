@@ -141,7 +141,7 @@ def file_signature(path):
     return [str(path), stat.st_size, stat.st_mtime_ns]
 
 
-# Publish on the destination filesystem, including when working space is node-local.
+# Publish on the destination filesystem, even when temporary files are stored elsewhere.
 def publish_file(source, destination):
     partial = destination.with_name(destination.name + ".partial")
     try:
@@ -168,6 +168,8 @@ def build_block(records, sources, windows, ids_frame, block_size, work_dir, dest
         raise ValueError(f"Not enough working space in {work_dir}; this block needs {required_bytes / 1024**3:.2f} GiB.")
 
     try:
+
+        # Column-major storage makes each source/window update contiguous on disk.
         scores = np.lib.format.open_memmap(path, mode="w+", dtype=np.float64,
                                           shape=(len(ids_frame), len(sources) * len(windows)), fortran_order=True)
         try:
@@ -182,6 +184,8 @@ def build_block(records, sources, windows, ids_frame, block_size, work_dir, dest
 
                     for source in present:
                         column = source_index[source] * len(windows) + window_index[window]
+
+                        # Sum additive partitions in float64 rather than averaging them.
                         scores[start:stop, column] += frame[source].to_numpy(dtype=np.float64)
                     start = stop
 
@@ -253,6 +257,8 @@ def write_output(block_paths, groups, sources, windows, ids_frame, output, block
                         target = np.memmap(scores_path, mode="r+", dtype=dtype,
                                            offset=output_offset + (output_start + start) * dtype.itemsize, shape=(count,))
                         try:
+
+                            # Convert precision only after the float64 partition sums are complete.
                             with np.errstate(over="ignore", invalid="ignore"):
                                 target[:] = values
 

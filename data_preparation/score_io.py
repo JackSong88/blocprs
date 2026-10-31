@@ -86,8 +86,27 @@ class ScoreTable:
             return
 
         n_sources = self.array.shape[2]
+
+        # Columns are window-major; division and remainder recover both array indices.
         window_indices, source_indices = selected // n_sources, selected % n_sources
         for start in range(0, len(self.ids), chunk_size):
             stop = min(start + chunk_size, len(self.ids))
             values = np.asarray(self.array[start:stop, window_indices, source_indices], dtype=dtype)
             yield self.ids.iloc[start:stop], values
+
+    # Read column-major extraction output sequentially, rather than gathering scattered rows.
+    def iter_feature_chunks(self, dtype=np.float32):
+
+        if self.array is None or not self.array.flags.f_contiguous:
+            raise ValueError("Feature-block reading requires a column-major binary score bundle.")
+
+        n, windows, sources = self.array.shape
+        width = max(1, READ_BUFFER_BYTES // (n * max(self.array.dtype.itemsize, np.dtype(dtype).itemsize)))
+        matrix = self.array.reshape(n, windows * sources, order="F")
+        column_order = np.arange(windows * sources).reshape(windows, sources).ravel(order="F")
+        for start in range(0, len(column_order), width):
+            stop = min(start + width, len(column_order))
+
+            # Copy a contiguous disk interval once; subsequent row selection is in memory.
+            values = np.array(matrix[:, start:stop], dtype=dtype, order="F", copy=True)
+            yield [self.columns[index] for index in column_order[start:stop]], values

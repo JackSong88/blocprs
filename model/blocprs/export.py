@@ -251,7 +251,8 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
     if np.any((~present) & (window_mean != 0)):
         raise ValueError("A missing source/window pair has a nonzero saved score mean; the panel is incomplete.")
 
-    # Combine sources without changing the input variant order.
+    # Apply each source/window multiplier before combining sources for the same SNP.
+    # sort=False keeps the first-seen variant order rather than sorting IDs.
     frame["weight"] = frame["weight"].to_numpy() * multipliers[w, k]
     combined = frame.groupby("variant_id", sort=False)["weight"].sum()
     output = variants.drop(columns=["source", "weight", "_allele_pair", *extra])
@@ -262,6 +263,7 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
     ]].reset_index(drop=True)
 
     # Center training scores and retain constants introduced by allele reversal.
+    # Raw dosage scoring has no centering step, so the saved offset supplies it.
     offset = -float(np.sum(multipliers * window_mean))
     if allele_offset is not None:
         offset += float(np.sum(allele_offset * multipliers[w, k]))

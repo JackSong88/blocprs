@@ -26,6 +26,8 @@ def read_annotated(path, cohort):
 def build_crosswalk(left, right):
     right_columns = ["source_key", "cartagene_id", "cartagene_effect_allele",
                      "cartagene_chr", "cartagene_position"]
+
+    # Join original source identities; coordinates can differ between genome builds.
     merged = left.merge(right[right_columns], on="source_key", how="inner", validate="one_to_one")
 
     if merged.empty:

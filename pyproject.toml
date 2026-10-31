@@ -10,10 +10,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = ["numpy", "scipy", "pandas", "scikit-learn", "statsmodels"]
+dependencies = ["numpy", "scipy", "pandas", "scikit-learn", "statsmodels", "joblib>=1.3", "threadpoolctl"]
 
 [project.optional-dependencies]
 preparation = ["zstandard", "liftover>=1.3.3"]
+plotting = ["matplotlib"]
+mtl-prs = ["pgenlib==0.94.1", "numba"]
 
 [tool.setuptools.packages.find]
 where = ["model"]

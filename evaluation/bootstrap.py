@@ -5,10 +5,13 @@ cases and controls. Only the evaluation regressions are refitted, not the PRS.
 """
 
 import gc
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
+from statsmodels.tools.sm_exceptions import PerfectSeparationError, PerfectSeparationWarning
 
 from blocprs.metrics import IncrementalR2, NagelkerkeR2, NonEstimableError
 
@@ -35,6 +38,82 @@ def _metric_values(y, covariates, scores, methods, metric_type, label):
         try:
             values[column] = metric.score(scores[:, column])
         except (NonEstimableError, np.linalg.LinAlgError, FloatingPointError) as exc:
+            raise NonEstimableError(f"{label}: method {method!r} failed: {exc}") from exc
+
+    return values
+
+
+# Frequency weights represent repeated participants without expanding the arrays.
+def _weighted_values(y, covariates, scores, methods, family, counts, label):
+    keep = counts > 0
+    weights = counts[keep].astype(float)
+    y, scores = y[keep], scores[keep]
+    covariates = np.empty((len(y), 0)) if covariates is None else covariates[keep]
+    design = np.column_stack((np.ones(len(y)), covariates))
+
+    # The likelihood normalization uses the resampled size, not the number of unique rows.
+    n = weights.sum()
+
+    if family == "gaussian":
+        sqrt_weights = np.sqrt(weights)
+        centered = y - np.average(y, weights=weights)
+        total_ss = float(weights @ (centered * centered))
+
+        if not np.isfinite(total_ss) or total_ss <= 0:
+            raise NonEstimableError(f"{label}: zero weighted phenotype variance.")
+
+        def fit(matrix):
+            coef = np.linalg.lstsq(matrix * sqrt_weights[:, None], y * sqrt_weights, rcond=None)[0]
+            residual = y - matrix @ coef
+            return float(weights @ (residual * residual))
+
+        def difference(null_value, full_value):
+            return (null_value - full_value) / total_ss
+
+    else:
+
+        def fit(matrix):
+
+            # Weighted centering and scaling improve IRLS conditioning without adding a penalty.
+            predictors = matrix[:, 1:]
+            centered = predictors - np.average(predictors, axis=0, weights=weights)
+            variance = np.average(centered * centered, axis=0, weights=weights)
+            varying = variance > 0
+            matrix = np.column_stack((np.ones(len(y)), centered[:, varying] / np.sqrt(variance[varying])))
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", PerfectSeparationWarning)
+                result = sm.GLM(y, matrix, family=sm.families.Binomial(), freq_weights=weights).fit(
+                    method="IRLS", maxiter=500, tol=1e-10)
+
+            if not result.converged or not np.isfinite(result.llf) or not np.isfinite(result.params).all():
+                raise NonEstimableError("Weighted logistic fit did not converge to a finite solution.")
+
+            return float(result.llf)
+
+        def difference(null_value, full_value):
+            denominator = 1.0 - np.exp(2.0 * null_value / n)
+
+            if not np.isfinite(denominator) or denominator <= 0:
+                raise NonEstimableError("Weighted Nagelkerke normalization is not estimable.")
+
+            return (1.0 - np.exp(-2.0 * (full_value - null_value) / n)) / denominator
+
+    errors = (NonEstimableError, np.linalg.LinAlgError, FloatingPointError,
+              PerfectSeparationError, PerfectSeparationWarning)
+    try:
+        null_value = fit(design)
+    except errors as exc:
+        raise NonEstimableError(f"{label}: covariate-only fit failed: {exc}") from exc
+
+    values = np.empty(len(methods), dtype=float)
+    for column, method in enumerate(methods):
+        try:
+            values[column] = difference(null_value, fit(np.column_stack((design, scores[:, column]))))
+
+            if not np.isfinite(values[column]):
+                raise NonEstimableError("Weighted metric is not finite.")
+
+        except errors as exc:
             raise NonEstimableError(f"{label}: method {method!r} failed: {exc}") from exc
 
     return values
@@ -83,15 +162,16 @@ def bootstrap_metrics(y, covariates, scores, *, family, n_boot=10000, seed=20260
     probabilities = [np.full(len(rows), 1.0 / len(rows)) for rows in strata]
 
     for replicate in range(n_boot):
+
+        # Multinomial counts describe sampling with replacement within each outcome stratum.
+        # Reuse the draw across methods to retain their paired dependence.
         counts = np.zeros(len(y), dtype=np.int64)
         for rows, probability in zip(strata, probabilities):
             counts[rows] = rng.multinomial(len(rows), probability)
 
-        # Repeated rows let us use exactly the same metric implementation as CV.
-        selected = np.repeat(participants, counts)
-        selected_covariates = None if covariates is None else covariates[selected]
-        replicates[replicate] = _metric_values(y[selected], selected_covariates, values[selected],
-                                               methods, metric_type, f"Bootstrap replicate {replicate + 1}")
+        # Weighted regressions preserve the draw without making repeated copies of participants.
+        replicates[replicate] = _weighted_values(y, covariates, values, methods, family, counts,
+                                                  f"Bootstrap replicate {replicate + 1}")
 
         # Release reference cycles in the logistic regression results.
         if binary:
@@ -115,6 +195,7 @@ def paired_comparisons(result, reference):
         if column == reference_column:
             continue
 
+        # Subtract within each shared resample; separate marginal intervals lose this pairing.
         differences = result.replicates[:, column] - result.replicates[:, reference_column]
         lower, upper = np.quantile(differences, [0.025, 0.975])
         rows.append({"method": method, "reference": reference,

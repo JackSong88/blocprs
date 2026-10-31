@@ -1,21 +1,28 @@
 # Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
 # Modified for BLocPRS.
 
-"""Join raw PRS and cohort inputs, then save one memory-mapped dataset."""
+"""Join raw PRS and cohort inputs using saved splits, then save a memory-mapped dataset."""
 
 import argparse
+import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 from tempfile import TemporaryDirectory
+from time import monotonic
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+from blocprs.selection import read_ids, stratum_labels
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from score_io import ScoreTable
+
+logger = logging.getLogger(__name__)
 
 
 def participant_index(table, label):
@@ -114,29 +121,14 @@ def score_participants(scores_file, metadata):
 
 
 def read_split_ids(path):
-    table = pd.read_csv(path, sep=r"\s+", header=None, dtype=str, skip_blank_lines=False)
-
-    if table.shape[1] not in (1, 2):
-        raise ValueError("Split files must contain one IID column or two FID/IID columns.")
-
-    first = tuple(str(value).lstrip("#").upper() for value in table.iloc[0])
-    if first in (("IID",), ("ID",), ("FID", "IID")):
-        table = table.iloc[1:]
-
-    if table.empty or table.isna().any().any() or any(table[column].str.strip().eq("").any() for column in table):
-        raise ValueError(f"Split file is empty or contains missing IDs: {path}")
-
+    table = read_ids(path)
     keys = table.iloc[:, 0].tolist() if table.shape[1] == 1 else list(table.itertuples(index=False, name=None))
-
-    if len(set(keys)) != len(keys):
-        raise ValueError(f"Duplicate participant IDs in split file: {path}")
-
     return keys, table.shape[1]
 
 
 # Preserve saved split order; otherwise split 70/30, stratifying binary traits.
 def assign_splits(metadata, family, train_ids_file=None, test_ids_file=None, all_participants=False,
-                  test_fraction=0.3, seed=7209, max_missing_split_id_fraction=0.0):
+                  test_fraction=0.3, seed=7209, stratify=None):
 
     if (train_ids_file is None) != (test_ids_file is None):
         raise ValueError("Supply both train and test ID files together.")
@@ -144,8 +136,8 @@ def assign_splits(metadata, family, train_ids_file=None, test_ids_file=None, all
     if all_participants and train_ids_file is not None:
         raise ValueError("Choose saved split files or all participants, not both.")
 
-    if not 0 <= max_missing_split_id_fraction < 1:
-        raise ValueError("max_missing_split_id_fraction must be in [0, 1).")
+    if stratify and (all_participants or train_ids_file is not None):
+        raise ValueError("--stratify applies only when creating a new random train/test split.")
 
     missing = 0
     if all_participants:
@@ -167,21 +159,20 @@ def assign_splits(metadata, family, train_ids_file=None, test_ids_file=None, all
         if not set(index).issubset(set(train_ids).union(test_ids)):
             raise ValueError("Some eligible participants are absent from both split files.")
 
+        # get_indexer returns -1 for absent IDs; count these before selecting any rows.
         train_rows, test_rows = index.get_indexer(train_ids), index.get_indexer(test_ids)
         missing = int((train_rows < 0).sum() + (test_rows < 0).sum())
 
-        if missing / (len(train_ids) + len(test_ids)) > max_missing_split_id_fraction:
-            raise ValueError(f"{missing} saved split IDs are absent from the eligible dataset; check inputs and eligibility before permitting an explicit missing-ID fraction.")
-
-        train_rows, test_rows = train_rows[train_rows >= 0], test_rows[test_rows >= 0]
+        if missing:
+            raise ValueError(f"{missing} saved split IDs are absent from the eligible dataset; check inputs and eligibility.")
     else:
 
         if not 0 < test_fraction < 1:
             raise ValueError("test_fraction must be in (0, 1).")
 
-        stratify = metadata["phenotype"].to_numpy() if family == "binomial" else None
+        labels = stratum_labels(metadata, stratify, binary_default=family == "binomial")
         train_rows, test_rows = train_test_split(np.arange(len(metadata)), test_size=test_fraction,
-                                                stratify=stratify, random_state=seed)
+                                                stratify=labels, random_state=seed)
 
     if not len(train_rows) or not len(test_rows):
         raise ValueError("Training and test sets must both contain participants.")
@@ -194,42 +185,68 @@ def assign_splits(metadata, family, train_ids_file=None, test_ids_file=None, all
     return result, missing
 
 
-# Stream raw scores into final participant order without building a full wide DataFrame.
+# Transpose column-major extraction output locally, then publish it with sequential I/O.
+def write_feature_ordered_scores(table, metadata, features, output_dir):
+    columns = features["column"].tolist()
+    column_positions = {name: index for index, name in enumerate(columns)}
+    rows = participant_index(table.ids, "Scores").get_indexer(metadata.index)
+
+    if (rows < 0).any():
+        raise ValueError("Selected participants are absent from the input scores.")
+
+    shape = (len(metadata), features["window"].nunique(), features["source"].nunique())
+    started = last_log = monotonic()
+    written = np.zeros(len(columns), dtype=bool)
+
+    # Temporary storage must have room for one uncompressed participant-major matrix.
+    with TemporaryDirectory(prefix="blocprs_dataset_", dir=os.environ.get("SLURM_TMPDIR")) as work:
+        required = int(np.prod(shape)) * np.dtype(np.float32).itemsize + 1024**2
+
+        if shutil.disk_usage(work).free < required:
+            raise OSError(f"Temporary storage needs at least {required / 1024**3:.1f} GiB for this dataset.")
+
+        path = Path(work) / "scores.npy"
+        logger.info("Assembling participant-major scores in temporary storage: N=%s, features=%s",
+                    len(metadata), len(columns))
+        scores = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
+        matrix = scores.reshape(len(metadata), -1)
+        try:
+            for names, values in table.iter_feature_chunks():
+
+                if not np.isfinite(values).all():
+                    raise ValueError("Score entries must be finite; missing values are not filled with zero.")
+
+                positions = np.array([column_positions[name] for name in names])
+                matrix[:, positions] = values[rows]
+                written[positions] = True
+
+                if monotonic() - last_log >= 60:
+                    logger.info("Assembling scores: %s/%s features (%.1f%%); elapsed=%.1fs",
+                                written.sum(), len(columns), 100 * written.mean(), monotonic() - started)
+                    last_log = monotonic()
+
+            if not written.all():
+                raise ValueError("Input scores do not cover every requested feature.")
+
+            scores.flush()
+        finally:
+            del matrix, scores
+
+        logger.info("Copying completed scores to output: %.2f GiB", path.stat().st_size / 1024**3)
+        shutil.copyfile(path, output_dir / "scores.npy")
+    logger.info("Score writing complete: elapsed=%.1fs", monotonic() - started)
+
+
+# Stream participant-major inputs in row blocks; transpose column-major inputs locally.
 def write_arrays(scores_file, metadata, features, covariate_names, output_dir):
     columns = features["column"].tolist()
     n_windows, n_sources = features["window"].nunique(), features["source"].nunique()
-    scores = np.lib.format.open_memmap(output_dir / "scores.npy", mode="w+", dtype=np.float32,
-                                     shape=(len(metadata), n_windows, n_sources))
-    written = np.zeros(len(metadata), dtype=bool)
-    chunk_size = max(1, min(10000, 32 * 1024**2 // (4 * len(columns))))
-    chunks = ScoreTable(scores_file).iter_chunks(columns=columns, chunk_size=chunk_size, dtype=np.float32)
-    try:
-        for block, (chunk_ids, values) in enumerate(chunks, start=1):
-            ids = participant_index(chunk_ids, "Scores")
+    table = ScoreTable(scores_file)
 
-            if not np.isfinite(values).all():
-                raise ValueError("Score entries must be finite; missing or malformed values are not filled with zero.")
-
-            positions = metadata.index.get_indexer(ids)
-            keep = positions >= 0
-            selected = positions[keep]
-
-            if written[selected].any():
-                raise ValueError("Repeated score participants encountered during array writing.")
-
-            scores[selected] = values[keep].reshape(-1, n_windows, n_sources)
-            written[selected] = True
-
-            # Flush completed blocks so dirty mapped pages do not accumulate.
-            if block % 16 == 0:
-                scores.flush()
-
-        if not written.all():
-            raise ValueError("The score file changed between ID selection and score writing.")
-
-        scores.flush()
-    finally:
-        del scores
+    if table.array is not None and table.array.flags.f_contiguous and n_windows > 1:
+        write_feature_ordered_scores(table, metadata, features, output_dir)
+    else:
+        write_row_ordered_scores(table, metadata, columns, n_windows, n_sources, output_dir)
 
     covariates = metadata[covariate_names].to_numpy(dtype=np.float32)
 
@@ -242,23 +259,79 @@ def write_arrays(scores_file, metadata, features, covariate_names, output_dir):
     pd.DataFrame({"covariate": covariate_names}).to_csv(output_dir / "covariates.tsv", sep="\t", index=False)
 
 
+# Keep bounded row reads for participant-major arrays and existing text inputs.
+def write_row_ordered_scores(table, metadata, columns, n_windows, n_sources, output_dir):
+    scores = np.lib.format.open_memmap(output_dir / "scores.npy", mode="w+", dtype=np.float32,
+                                     shape=(len(metadata), n_windows, n_sources))
+    written = np.zeros(len(metadata), dtype=bool)
+    chunk_size = max(1, min(10000, 32 * 1024**2 // (4 * len(columns))))
+    chunks = table.iter_chunks(columns=columns, chunk_size=chunk_size, dtype=np.float32)
+    started = last_log = monotonic()
+    completed = 0
+    logger.info("Writing scores: N=%s, windows=%s, sources=%s", len(metadata), n_windows, n_sources)
+    try:
+        for block, (chunk_ids, values) in enumerate(chunks, start=1):
+            ids = participant_index(chunk_ids, "Scores")
+
+            if not np.isfinite(values).all():
+                raise ValueError("Score entries must be finite; missing or malformed values are not filled with zero.")
+
+            # Map streamed rows into the saved train/test order, not score-file order.
+            positions = metadata.index.get_indexer(ids)
+            keep = positions >= 0
+            selected = positions[keep]
+
+            if written[selected].any():
+                raise ValueError("Repeated score participants encountered during array writing.")
+
+            scores[selected] = values[keep].reshape(-1, n_windows, n_sources)
+            written[selected] = True
+            completed += len(selected)
+
+            if monotonic() - last_log >= 60:
+                logger.info("Writing scores: %s/%s participants (%.1f%%); elapsed=%.1fs",
+                            completed, len(metadata), 100 * completed / len(metadata), monotonic() - started)
+                last_log = monotonic()
+
+            # Flush completed blocks so dirty mapped pages do not accumulate.
+            if block % 16 == 0:
+                scores.flush()
+
+        if not written.all():
+            raise ValueError("The score file changed between ID selection and score writing.")
+
+        scores.flush()
+    finally:
+        del scores
+
+    logger.info("Score writing complete: elapsed=%.1fs", monotonic() - started)
+
+
 def create_datasets(scores_file, phenotype_file, covariates_file, ancestry_file, output_dir, family,
-                    num_pcs=10, train_ids_file=None, test_ids_file=None, all_participants=False,
-                    test_fraction=0.3, seed=7209, max_missing_split_id_fraction=0.0):
+                    num_pcs=10, train_ids_file=None, test_ids_file=None, all_participants=False):
 
     if family not in ("gaussian", "binomial") or num_pcs < 0:
         raise ValueError("Use gaussian/binomial family and a nonnegative number of PCs.")
+
+    if not all_participants and (train_ids_file is None or test_ids_file is None):
+        raise ValueError("Supply train/test ID files from create_splits.py, or use --all-participants for transfer data.")
 
     output_dir = Path(output_dir)
 
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"Refusing to replace an existing dataset: {output_dir}")
 
+    started = monotonic()
+    logger.info("Preparing dataset: scores=%s; family=%s", scores_file, family)
     features = feature_layout(scores_file)
     metadata, covariate_names = read_metadata(phenotype_file, covariates_file, ancestry_file, num_pcs, family)
     metadata, score_count, missing_scores = score_participants(scores_file, metadata)
+
+    # Reuse the same participant membership and order for every score representation.
     metadata, missing_split_ids = assign_splits(metadata, family, train_ids_file, test_ids_file,
-                                               all_participants, test_fraction, seed, max_missing_split_id_fraction)
+                                               all_participants)
+    logger.info("Selected N=%s; splits=%s; windows=%s; sources=%s", len(metadata),
+                metadata["split"].value_counts().to_dict(), features["window"].nunique(), features["source"].nunique())
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output_dir.parent, prefix=".dataset_") as temporary:
         temporary = Path(temporary)
@@ -277,18 +350,20 @@ def create_datasets(scores_file, phenotype_file, covariates_file, ancestry_file,
                 path.unlink()
             output_dir.rmdir()
             raise
+    logger.info("Dataset saved: %s; elapsed=%.1fs", output_dir, monotonic() - started)
     return {"participants": len(metadata), "score_rows": score_count, "eligible_without_scores": missing_scores,
             "missing_split_ids": missing_split_ids, "splits": metadata["split"].value_counts().to_dict()}
 
 
 # Load a saved dataset through the model package.
-def load_dataset(path, split="train"):
+def load_dataset(path, split="train", ids_file=None):
     from blocprs import load_dataset as load
 
-    return load(path, split=split)
+    return load(path, split=split, ids_file=ids_file)
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scores-file", required=True, help="Binary raw-score directory, or tab-separated scores with FID/IID (optional gzip compression).")
     parser.add_argument("--phenotype-file", required=True, help="Headerless FID, IID, phenotype table.")
@@ -300,16 +375,13 @@ def main():
     parser.add_argument("--train-ids-file", help="Saved IID list or FID/IID pairs, preserving file order.")
     parser.add_argument("--test-ids-file", help="Saved disjoint test IDs in the same format as the train file.")
     parser.add_argument("--all-participants", action="store_true", help="Save all eligible transfer participants without making a new split.")
-    parser.add_argument("--test-fraction", type=float, default=0.3, help="Random test fraction when saved IDs are absent (default: 0.3).")
-    parser.add_argument("--seed", type=int, default=7209, help="Random-split seed (default: 7209).")
-    parser.add_argument("--max-missing-split-id-fraction", type=float, default=0.0, help="Explicitly permit this fraction of saved IDs to be absent after eligibility filtering (default: 0).")
     args = parser.parse_args()
     try:
         result = create_datasets(**vars(args))
     except (OSError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
-    print(f"Saved {result['participants']} participants to {args.output_dir}; split counts: {result['splits']}.")
-    print(f"Score rows read: {result['score_rows']}; otherwise eligible participants without scores: {result['eligible_without_scores']}; absent saved split IDs: {result['missing_split_ids']}.")
+    print(f"Saved {result['participants']} participants to {args.output_dir}; split counts: {result['splits']}.", flush=True)
+    print(f"Score rows read: {result['score_rows']}; otherwise eligible participants without scores: {result['eligible_without_scores']}; absent saved split IDs: {result['missing_split_ids']}.", flush=True)
 
 
 if __name__ == "__main__":

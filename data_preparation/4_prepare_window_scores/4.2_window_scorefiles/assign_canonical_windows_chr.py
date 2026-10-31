@@ -37,6 +37,8 @@ def load_windows(path, chromosome):
 def assign_windows(crosswalk, windows):
     positions = pd.to_numeric(crosswalk["ukbb_position"], errors="raise").to_numpy(dtype=np.int64)
     starts, ends = windows["start_bp"].to_numpy(), windows["end_bp"].to_numpy()
+
+    # Find the last start <= position, then check the inclusive end below.
     indices = np.searchsorted(starts, positions, side="right") - 1
 
     if not ((indices >= 0) & (positions <= ends[np.maximum(indices, 0)])).all():

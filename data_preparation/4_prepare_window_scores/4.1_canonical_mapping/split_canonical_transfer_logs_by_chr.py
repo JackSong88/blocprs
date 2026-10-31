@@ -133,6 +133,8 @@ def annotate_chunk(chunk: pd.DataFrame, source_cache: SourceMapCache,
     chunk["chr_name"] = chunk["chr_name"].map(normalize_chr)
     chunk["chr_position"] = pd.to_numeric(chunk["chr_position"], errors="coerce")
     chunk["row_nr"] = pd.to_numeric(chunk["row_nr"], errors="coerce")
+
+    # Reuse pgsc_calc's accepted best match instead of rematching alleles here.
     keep = (chunk["chr_name"].isin(chromosomes)
             & chunk["chr_position"].notna() & chunk["row_nr"].notna()
             & chunk["match_status"].fillna("").astype(str).str.lower().eq("matched")
@@ -149,6 +151,8 @@ def annotate_chunk(chunk: pd.DataFrame, source_cache: SourceMapCache,
     annotated = []
     for accession, group in chunk.groupby("accession", sort=False):
         source_map = source_cache.get(accession)
+
+        # Row numbers refer to this build's source file, not the other cohort's file.
         merged = group.merge(source_map, on="row_nr", how="left", validate="many_to_one")
         missing = merged["source_key"].isna()
         stats["missing_source_rows"] += int(missing.sum())

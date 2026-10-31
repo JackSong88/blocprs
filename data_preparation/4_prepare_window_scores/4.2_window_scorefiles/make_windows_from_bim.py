@@ -107,12 +107,12 @@ def make_windows_from_variants(variants: pd.DataFrame, mb_size: int) -> pd.DataF
     n_snps counts reference variant rows in each window.
     """
 
-    # 1-based BP -> 0-based window index
     variants = variants.copy()
 
     if (variants["BP"] < 1).any():
         raise ValueError("Variant positions must be positive and 1-based.")
 
+    # Subtract 1 so an exact upper boundary stays in the preceding 1-based window.
     variants["window_id"] = (variants["BP"] - 1) // mb_size
 
     grp = variants.groupby(["CHR", "window_id"], sort=True)["BP"]

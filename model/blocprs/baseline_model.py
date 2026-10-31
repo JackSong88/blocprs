@@ -3,7 +3,7 @@
 MultiPRS combines source scores using unregularized linear or logistic
 regression, with optional regularization or nonnegative source coefficients.
 The intercept and covariate effects remain unpenalized. Regularization
-parameters are selected by cross-validation using the same covariate-adjusted
+parameters are selected by cross-validation using the same incremental
 metrics as evaluation.
 """
 
@@ -22,16 +22,13 @@ from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from .cv import _positive_integer, _subsample_indices
-from .data import PRSData
+from .data import PRSData, select_sources
 from .metrics import IncrementalR2, NagelkerkeR2
 
 
 # Select one named source without choosing it using evaluation outcomes.
 def select_source(data, source):
-    index = data.source_names.index(source)
-    return PRSData(data.window_scores[:, :, index:index + 1], [source], data.window_names,
-                   y=data.y, covariates=data.covariates, covariate_names=data.covariate_names,
-                   sample_ids=data.sample_ids)
+    return select_sources(data, [source])
 
 
 # Explicitly sum raw window scores when a genome-wide dataset is unavailable.
@@ -67,8 +64,11 @@ class _SourceScaler:
         return (sources - self.source_mean) / self.source_sd
 
 
-# Remove the intercept/covariate component before continuous source fitting.
+# Remove the intercept/covariate component before continuous source fitting (FWL).
 def _residuals(nuisance, sources, y):
+
+    # Residualize y and every source together. This leaves covariate effects
+    # unrestricted while fitting or penalizing only the source coefficients.
     values = np.column_stack((y, sources))
     residual = values - nuisance @ np.linalg.lstsq(nuisance, values, rcond=None)[0]
     return residual[:, 1:], residual[:, 0]
@@ -90,8 +90,12 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
         if variant == "nonnegative":
             gamma = nnls(X_res, y_res)[0]
         elif lambda_ == 0:
+
+            # Solve OLS on the covariate-residualized scores and phenotype.
             gamma = np.linalg.lstsq(X_res, y_res, rcond=None)[0]
         elif l1 == 0:
+
+            # Ridge adds lambda to the diagonal; dividing by n matches the mean loss.
             gram = X_res.T @ X_res / n
             gamma = np.linalg.solve(gram + l2 * np.eye(k), X_res.T @ y_res / n)
         else:
@@ -106,6 +110,7 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
             gamma = fitted.coef_
             iterations = int(fitted.n_iter_)
 
+        # Fit intercept and covariates to y minus the fitted genetic score.
         alpha = np.linalg.lstsq(nuisance, y - sources @ gamma, rcond=None)[0]
         coef = np.concatenate((alpha, gamma))
         residual = y - nuisance @ alpha - sources @ gamma
@@ -114,6 +119,7 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
         return coef, {"objective": objective, "iterations": iterations, "converged": True}
 
     # At the L1 zero-solution bound, return the fitted null model exactly.
+    # When the penalty exceeds every source gradient, zero source effects are optimal.
     if l1 > 0:
         null_coef, null_info, max_gradient = (_binomial_null(nuisance, sources, y)
                                              if null_fit is None else null_fit)
@@ -297,6 +303,9 @@ class MultiPRS:
         lambda_ = selected
 
         if search and self.variant in ("lasso", "elasticnet"):
+
+            # CV selects a fraction of the zero-solution bound. Recompute that
+            # bound on all training rows to obtain the final absolute penalty.
             lambda_ *= _lambda_max(nuisance, standardized, y, self.family, ratio, residuals, null_fit)
 
         coef, fit_info = _fit_once(nuisance, standardized, y, self.family, self.variant,

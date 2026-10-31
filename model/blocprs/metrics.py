@@ -41,14 +41,26 @@ def _inputs(y, covariates):
     return y.copy(), covariates.copy()
 
 
-# Require one finite genetic score per evaluation participant.
-def _score_vector(genetic_score, y):
+# Standardize the frozen score for the unpenalized evaluation regression.
+def _standardized_score(genetic_score, y):
     score = np.asarray(genetic_score, dtype=np.float64)
 
     if score.shape != y.shape or not np.isfinite(score).all():
         raise ValueError("Genetic score must be a finite vector matching the participants.")
 
-    return score
+    # A constant score contributes nothing beyond the intercept.
+    if np.all(score == score[0]):
+        return np.zeros_like(score)
+
+    # Rescale only this auxiliary regression's input for numerical stability.
+    # With a free intercept and score coefficient, its fitted values are unchanged in exact arithmetic.
+    score = score - score.mean()
+    score_sd = score.std(ddof=0)
+
+    if not np.isfinite(score_sd) or score_sd <= 0:
+        raise NonEstimableError("Genetic score SD is not finite and positive.")
+
+    return score / score_sd
 
 
 class IncrementalR2:
@@ -73,7 +85,7 @@ class IncrementalR2:
 
     # Refit OLS with the frozen score and return its incremental R^2.
     def score(self, genetic_score):
-        score = _score_vector(genetic_score, self.y)
+        score = _standardized_score(genetic_score, self.y)
 
         # A constant score adds no information beyond the intercept.
         if np.all(score == score[0]):
@@ -123,6 +135,8 @@ class NagelkerkeR2:
     # Return the logistic log-likelihood only when the fit converges and is finite.
     def _fit_log_likelihood(self, covariates, label):
         try:
+
+            # This unpenalized fit estimates evaluation calibration, not new PRS combination weights.
             result = sm.Logit(self.y, sm.add_constant(covariates)).fit(disp=0)
         except (np.linalg.LinAlgError, PerfectSeparationError, FloatingPointError) as exc:
             raise NonEstimableError(f"Nagelkerke {label} fit is not estimable: {exc}") from exc
@@ -136,7 +150,7 @@ class NagelkerkeR2:
 
     # Refit logistic regression with the frozen score and return Nagelkerke R^2.
     def score(self, genetic_score):
-        score = _score_vector(genetic_score, self.y)
+        score = _standardized_score(genetic_score, self.y)
 
         # A constant score adds no information beyond the intercept.
         if np.all(score == score[0]):

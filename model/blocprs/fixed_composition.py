@@ -125,8 +125,13 @@ class FixedCompositionBLocPRS:
         fitting_order = sorted(results, key=lambda entry: -entry["lambda"]) if self.family == "binomial" else results
 
         for train_rows, validation_rows in splitter.split(np.zeros((total, 1)), sampled_y):
+
+            # Refit the source mixture inside the fold so validation outcomes cannot set it.
             mixture = MultiPRS(self.family, variant="unregularized", block_size=self.block_size)
             mixture.fit(_rows(genomewide_data, sampled[train_rows]))
+
+            # Convert standardized-score coefficients to weights on raw window scores.
+            # The second-stage training centering accounts for the mixture's constant offset.
             source_weights = mixture.gamma_ / mixture.scaler_.source_sd
             combined = _combined_data(data, source_weights, self.block_size, sampled)
             training_data = _rows(combined, train_rows)
@@ -182,6 +187,8 @@ class FixedCompositionBLocPRS:
             selected, results = float(self.lambda_), []
 
         mixture = MultiPRS(self.family, variant="unregularized", block_size=self.block_size).fit(genomewide_data)
+
+        # Freeze one source composition across windows; only its regional scaling can vary.
         source_weights = mixture.gamma_ / mixture.scaler_.source_sd
         combined = _combined_data(data, source_weights, self.block_size)
         regional = BLocPRS(self.family, lambda_=selected, block_size=self.block_size).fit(combined)

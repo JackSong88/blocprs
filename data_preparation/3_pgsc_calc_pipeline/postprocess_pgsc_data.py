@@ -31,6 +31,8 @@ def prepare_outputs(paths):
 
 
 def extract_scores(scores_file, sampleset, source_table, output_dir, analyses=None):
+
+    # Use raw SUM scores; standardization is learned later during model fitting.
     scores = pd.read_csv(scores_file, sep="\t", usecols=["sampleset", "FID", "IID", "PGS", "SUM"],
                          dtype={"sampleset": str, "FID": str, "IID": str, "PGS": str, "SUM": float})
     scores = scores.loc[scores["sampleset"].eq(sampleset)]
@@ -48,7 +50,8 @@ def extract_scores(scores_file, sampleset, source_table, output_dir, analyses=No
     if scores.columns.duplicated().any():
         raise ValueError("Source names are duplicated after removing build suffixes.")
 
-    panel = pd.read_csv(source_table, dtype=str)
+    tables = [source_table] if isinstance(source_table, (str, Path)) else source_table
+    panel = pd.concat([pd.read_csv(path, dtype=str) for path in tables], ignore_index=True)
     group = "AnalysisID" if "AnalysisID" in panel.columns else "Phenotype_short"
     if analyses:
         missing = set(analyses).difference(panel[group].dropna())
@@ -104,6 +107,8 @@ def extract_ancestry(popsimilarity, sampleset, covariates, covariates_out, ances
     native = native.iloc[:, [0, 1, 2, -1]].copy()
     native.columns = ["FID", "IID", "Sex", "Age"]
     check_ids(native, "Native covariates")
+
+    # Replace native PCs with projected PCs while retaining recorded sex and age.
     covariate_table = native.merge(projected[["FID", "IID"] + pcs], on=["FID", "IID"],
                                    how="inner", validate="one_to_one")
 
@@ -130,13 +135,15 @@ def extract_ancestry(popsimilarity, sampleset, covariates, covariates_out, ances
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    table_dir = Path(__file__).resolve().parents[2] / "tables"
+    source_tables = [table_dir / name for name in ("multi_ancestry_prs_table.csv", "multitrait_prs_table.csv", "sex_biased_prs_table.csv")]
 
     scores = commands.add_parser("scores", help="Extract per-analysis raw SUM scores.")
     scores.add_argument("--scores-file", type=Path,
                         help="Raw scores (default: data/{sampleset}/pgsc/{sampleset}/score/{sampleset}_pgs.txt.gz).")
     scores.add_argument("--sampleset", default="ukbb", help="Cohort label (default: ukbb).")
-    scores.add_argument("--source-table", type=Path, default=Path("data/source_panel.csv"),
-                        help="Source-panel CSV (default: data/source_panel.csv).")
+    scores.add_argument("--source-table", type=Path, nargs="+", default=source_tables,
+                        help="Source-panel CSVs; defaults to the three published panels in tables/.")
     scores.add_argument("--analyses", nargs="+")
     scores.add_argument("--output-dir", type=Path,
                         help="Per-analysis output root (default: data/{sampleset}/source_scores).")

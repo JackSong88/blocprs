@@ -161,6 +161,9 @@ def make_source_key(accession: str, row: dict[str, str]) -> tuple[str, str, str]
         pos = row.get("chr_position", "").strip()
         variant_id = f"{chrom}:{pos}"
         key_type = "source_chrpos"
+
+    # Match original source effects across builds, not cohort-local variant IDs.
+    # Alleles and weight distinguish different entries for the same SNP.
     key = "|".join([accession, key_type, variant_id, effect_allele, other_allele, effect_weight])
     return key, key_type, variant_id
 

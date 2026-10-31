@@ -11,6 +11,7 @@ from blocprs.baseline_model import MultiPRS, SingleSourcePRS
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True, help="Packaged genome-wide dataset directory.")
+    parser.add_argument("--train-ids", type=Path, help="Training-subset IDs; participants must belong to the stored train split.")
     parser.add_argument("--family", choices=("gaussian", "binomial"), required=True)
     parser.add_argument("--output", type=Path, required=True, help="One fitted model archive (.npz).")
     parser.add_argument("--source", help="Fit this single source instead of MultiPRS; no automatic source selection.")
@@ -27,7 +28,7 @@ def parse_args(argv=None):
 # Fit the stored training split and save the coefficients and source scaling.
 def main(argv=None):
     args = parse_args(argv)
-    data = load_dataset(args.dataset, split="train")
+    data = load_dataset(args.dataset, split="train", ids_file=args.train_ids)
 
     if args.source:
         if args.variant != "unregularized" or args.lambda_ is not None or args.l1_ratio is not None:

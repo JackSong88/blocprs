@@ -18,6 +18,8 @@ def prepare_samplesheet(sampleset, prefix_template, genotype_format, chromosomes
 
     rows = []
     for chromosome in chromosomes:
+
+        # Absolute paths remain valid when Nextflow runs tasks in working directories.
         prefix = Path(prefix_template.format(chrom=chromosome)).expanduser().resolve()
         rows.append({"sampleset": sampleset, "path_prefix": str(prefix),
                      "chrom": chromosome, "format": genotype_format})

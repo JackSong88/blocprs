@@ -13,6 +13,48 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .selection import id_positions
+
+
+class _ScoreView:
+    """Read selected participants and sources one requested block at a time."""
+
+    # Store index mappings, not a copy of the score matrix.
+    def __init__(self, scores, rows=None, sources=None):
+        rows = np.arange(scores.shape[0]) if rows is None else np.asarray(rows)
+        sources = np.arange(scores.shape[2]) if sources is None else np.asarray(sources)
+        if isinstance(scores, _ScoreView):
+            rows, sources = scores.rows[rows], scores.sources[sources]
+            scores = scores.scores
+        self.scores, self.rows, self.sources = scores, rows, sources
+        self.shape = (len(rows), scores.shape[1], len(sources))
+        self.ndim, self.dtype = 3, scores.dtype
+
+    # Read only the requested rows, windows and sources into memory.
+    def __getitem__(self, key):
+        key = key if isinstance(key, tuple) else (key,)
+        ellipsis = next((i for i, item in enumerate(key) if item is Ellipsis), None)
+        if ellipsis is not None:
+
+            # Expand ... into the missing full-axis slices of this three-dimensional array.
+            key = key[:ellipsis] + (slice(None),) * (4 - len(key)) + key[ellipsis + 1:]
+
+        if len(key) > 3:
+            raise IndexError("Window scores have three dimensions.")
+
+        key = key + (slice(None),) * (3 - len(key))
+
+        if any(not isinstance(index, (slice, Integral)) or isinstance(index, (bool, np.bool_)) for index in key[1:]):
+            raise IndexError("Use scalar/slice window and source indices; select_sources handles named source lists.")
+
+        selected = (self.rows[key[0]], np.arange(self.shape[1])[key[1]], self.sources[key[2]])
+
+        # np.ix_ gathers all selected row/window/source combinations, not paired indices.
+        # Unused source columns are never loaded into this block.
+        values = self.scores[np.ix_(*(np.atleast_1d(indices) for indices in selected))]
+        scalar_axes = tuple(axis for axis, indices in enumerate(selected) if np.ndim(indices) == 0)
+        return values.squeeze(axis=scalar_axes)
+
 
 # Check that names are unique and nonempty, keeping their supplied order.
 def _names(values, size, label):
@@ -31,7 +73,7 @@ def _names(values, size, label):
 
 # Check numeric type and shape without copying existing score arrays.
 def _numeric(values, ndim, label):
-    array = np.asanyarray(values)
+    array = values if isinstance(values, _ScoreView) else np.asanyarray(values)
 
     if np.ma.isMaskedArray(array) or array.ndim != ndim or array.dtype.kind not in "biuf":
         raise ValueError(f"{label} must be a {ndim}-dimensional ordinary real numeric array.")
@@ -129,12 +171,13 @@ class PRSData:
             self.sample_ids = ids
 
 
-# Load one saved split, keeping score and covariate arrays on disk.
-def load_dataset(path, split="train"):
+# Load one saved split, keeping large score arrays on disk.
+def load_dataset(path, split="train", ids_file=None):
     """Load a stage-5 dataset as PRSData, without standardizing its values.
 
     Select the stored 'train', 'test' or 'all' split. Only split=None combines
     all stored rows; 'all' is the transfer split, not a train/test combination.
+    An ID file selects participants within that split, retaining file order.
     """
     path = Path(path)
     participants = pd.read_csv(path / "participants.tsv", sep="\t", dtype={"FID": str, "IID": str},
@@ -165,15 +208,35 @@ def load_dataset(path, split="train"):
 
     rows = np.arange(len(participants)) if split is None else np.flatnonzero(participants["split"].eq(split))
 
-    # Contiguous rows preserve memory-mapped slicing.
-    if len(rows) == 0 or rows[-1] - rows[0] + 1 != len(rows):
-        raise ValueError(f"Split {split!r} must contain a nonempty contiguous block of participants.")
+    if ids_file is not None:
+        rows = rows[id_positions(participants.iloc[rows], ids_file)]
 
-    selection = slice(int(rows[0]), int(rows[-1]) + 1)
+    if len(rows) == 0:
+        raise ValueError(f"Split {split!r} contains no selected participants.")
+
+    # Contiguous splits remain ordinary slices; other selections are blockwise views.
+    contiguous = np.all(np.diff(rows) == 1)
+    selection = slice(int(rows[0]), int(rows[-1]) + 1) if contiguous else rows
+    selected_scores = scores[selection] if contiguous else _ScoreView(scores, rows)
     selected = participants.iloc[selection]
-    return PRSData(scores[selection], sources, windows, y=selected["phenotype"].to_numpy(dtype=float),
+    return PRSData(selected_scores, sources, windows, y=selected["phenotype"].to_numpy(dtype=float),
                    covariates=covariates[selection], covariate_names=covariate_names,
                    sample_ids=selected[["FID", "IID"]].to_numpy())
+
+
+# Select named sources in the supplied order, without copying the score tensor.
+def select_sources(data, source_names):
+    source_names = tuple(source_names)
+
+    if not source_names or len(set(source_names)) != len(source_names):
+        raise ValueError("Select at least one distinct source name.")
+
+    if source_names == data.source_names:
+        return data
+    sources = [data.source_names.index(name) for name in source_names]
+    return PRSData(_ScoreView(data.window_scores, sources=sources), source_names, data.window_names,
+                   y=data.y, covariates=data.covariates, covariate_names=data.covariate_names,
+                   sample_ids=data.sample_ids)
 
 
 @dataclass
@@ -239,9 +302,9 @@ class Scaler:
         if self.family == "binomial" and (self.y_mean != 0 or self.y_sd != 1):
             raise ValueError("Binomial outcomes must remain unscaled.")
 
-    # Compute training means and SDs in blocks, accumulating sums in float64.
+    # Compute means and SDs from training rows in blocks, using float64 sums.
     @classmethod
-    def fit(cls, data, family, block_size=8192):
+    def fit(cls, data, family, block_size=8192, *, rows=None):
         block_size = _block_size(block_size)
 
         if family not in ("gaussian", "binomial"):
@@ -250,6 +313,16 @@ class Scaler:
         if data.y is None:
             raise ValueError("Fitting a scaler requires training outcomes.")
 
+        # Select fold-training rows without copying the full score matrix.
+        if rows is not None:
+            rows = np.asarray(rows)
+
+            if (rows.ndim != 1 or rows.dtype.kind not in "iu" or rows.size == 0
+                or np.any(rows < 0) or np.any(rows >= data.n_samples)
+                or len(np.unique(rows)) != len(rows)):
+                raise ValueError("rows must be unique, in-range integer indices.")
+
+        n_samples = data.n_samples if rows is None else len(rows)
         window_sum = np.zeros((data.n_windows, data.n_sources), dtype=np.float64)
         global_sum = np.zeros(data.n_sources, dtype=np.float64)
         cov_sum = np.zeros(data.n_covariates, dtype=np.float64)
@@ -260,13 +333,14 @@ class Scaler:
 
         # Compute means first, then squared deviations for more accurate SDs.
         for pass_number in (0, 1):
-            for start in range(0, data.n_samples, block_size):
-                rows = slice(start, min(start + block_size, data.n_samples))
-                windows = _float32(data.window_scores[rows], "window_scores")
-                covariates = _float32(data.covariates[rows], "covariates")
-                y = _float32(data.y[rows], "y")
+            for start in range(0, n_samples, block_size):
+                stop = min(start + block_size, n_samples)
+                selection = slice(start, stop) if rows is None else rows[start:stop]
+                windows = _float32(data.window_scores[selection], "window_scores")
+                covariates = _float32(data.covariates[selection], "covariates")
+                y = _float32(data.y[selection], "y")
 
-                if family == "binomial" and not np.isin(data.y[rows], (0, 1)).all():
+                if family == "binomial" and not np.isin(data.y[selection], (0, 1)).all():
                     raise ValueError("Binomial outcomes must be exactly 0 or 1.")
 
                 # Sum windows to get each source's genome-wide score.
@@ -280,11 +354,14 @@ class Scaler:
                     # Identify columns with at most two distinct values before rounding.
                     for j in range(data.n_covariates + 1):
                         if len(distinct[j]) <= 2:
-                            raw = data.y[rows] if j == data.n_covariates else data.covariates[rows, j]
+                            raw = (data.y[selection] if j == data.n_covariates
+                                   else data.covariates[selection, j])
                             distinct[j].update(np.unique(raw)[:3].tolist())
 
                 else:
                     global_score -= global_mean
+
+                    # Sum squared deviations over participants, retaining one value per source.
                     global_ss += np.einsum("ij,ij->j", global_score, global_score)
                     cov_delta = covariates.astype(np.float64) - cov_mean
                     cov_ss += np.einsum("ij,ij->j", cov_delta, cov_delta)
@@ -292,16 +369,16 @@ class Scaler:
                     y_ss += float(y_delta @ y_delta)
 
             if pass_number == 0:
-                global_mean = global_sum / data.n_samples
-                cov_mean = cov_sum / data.n_samples
-                y_mean = y_sum / data.n_samples
+                global_mean = global_sum / n_samples
+                cov_mean = cov_sum / n_samples
+                y_mean = y_sum / n_samples
 
         if family == "binomial" and distinct[-1] != {0, 1}:
             raise ValueError("Binomial training outcomes must contain both classes.")
 
         # Population SD (ddof=0); use 1 for constant columns to avoid division by zero.
-        source_sd = np.sqrt(global_ss / data.n_samples).astype(np.float32)
-        cov_sd = np.sqrt(cov_ss / data.n_samples).astype(np.float32)
+        source_sd = np.sqrt(global_ss / n_samples).astype(np.float32)
+        cov_sd = np.sqrt(cov_ss / n_samples).astype(np.float32)
         source_sd[source_sd == 0] = 1
         cov_sd[cov_sd == 0] = 1
 
@@ -309,14 +386,14 @@ class Scaler:
         for j in range(data.n_covariates):
             if len(distinct[j]) <= 2:
                 cov_mean[j], cov_sd[j] = 0, 1
-        y_sd = np.float32(np.sqrt(y_ss / data.n_samples))
+        y_sd = np.float32(np.sqrt(y_ss / n_samples))
         if family == "binomial" or len(distinct[-1]) <= 2:
             y_mean, y_sd = 0, 1
         elif y_sd == 0:
             y_sd = 1
 
         return cls(family, data.source_names, data.window_names, data.covariate_names,
-                   window_sum / data.n_samples, source_sd, cov_mean, cov_sd, y_mean, y_sd)
+                   window_sum / n_samples, source_sd, cov_mean, cov_sd, y_mean, y_sd)
 
     # Standardize windows using their training means and genome-wide source SDs.
     def transform_windows(self, values):
@@ -326,6 +403,7 @@ class Scaler:
             raise ValueError("Window-score block does not match the fitted layout.")
 
         # S_window = (raw_window - training_window_mean) / training_source_SD.
+        # Using one SD per source makes the window sum equal its standardized genome-wide score.
         result -= self.window_mean
         result /= self.source_sd
 
@@ -435,6 +513,7 @@ class Design:
             X[:, 1:first_genetic] = self.scaler.transform_covariates(data.covariates[rows])
 
             # S_global sums windows; Z subtracts each source's uniform window share.
+            # The contrasts sum to zero across windows, separating local from global effects.
             windows = X[:, first_window:].reshape(-1, data.n_windows, data.n_sources)
             windows[:] = self.scaler.transform_windows(data.window_scores[rows])
             global_score = X[:, first_genetic:first_window]

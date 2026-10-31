@@ -5,8 +5,8 @@
 
 #SBATCH --job-name=blocprs_pgsc_calc
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=180G
-#SBATCH --time=20:00:00
+#SBATCH --mem=160G
+#SBATCH --time=16:00:00
 #SBATCH --output=blocprs_pgsc_calc_%j.log
 
 set -euo pipefail
@@ -18,6 +18,13 @@ case "$cohort" in
   *) echo "Cohort must be ukbb or cartagene." >&2; exit 2 ;;
 esac
 
+# Slurm runs a temporary script copy; submit batch jobs from the repository root.
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -f "$script_dir/custom.config" ]]; then
+  cd -- "$script_dir/../.."
+else
+  cd -- "$SLURM_SUBMIT_DIR"
+fi
 root="$PWD"
 cohort_dir="$root/data/$cohort"
 
@@ -43,7 +50,7 @@ mkdir -p "$cohort_dir/pgsc" "$cohort_dir/pgsc_work" "$cohort_dir/pgsc_launch" \
 
 # Separate Nextflow logs and retained work for each cohort.
 cd "$cohort_dir/pgsc_launch"
-nextflow -c "$root/data_preparation/3_pgsc_calc_pipeline/custom.config" run pgscatalog/pgsc_calc \
+"$NXF_HOME/nextflow" -c "$root/data_preparation/3_pgsc_calc_pipeline/custom.config" run pgscatalog/pgsc_calc \
   -r v2.1.0 \
   -profile singularity \
   --custom_config_base "$root/data/nextflow/offline_configs" \
