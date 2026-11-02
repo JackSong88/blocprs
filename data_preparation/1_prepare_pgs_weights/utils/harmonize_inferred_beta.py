@@ -31,37 +31,45 @@ def prepare_weights(input_file):
     return weights.drop(columns=["PIP", "VAR_BETA"], errors="ignore").rename(columns=columns)
 
 
-# Map 1-based coordinates; pgsc_calc matches source alleles to the target strand.
+# Converts GRCh37 coordinates to GRCh38 using 1-based positions.
+# pgsc_calc matches alleles, in case strands differ.
 def liftover_weights(weights):
     from liftover import get_lifter
 
     converter = get_lifter("hg19", "hg38", one_based=True)
     kept, coordinates = [], []
+
     for index, row in enumerate(weights.itertuples(index=False)):
         try:
             matches = set(converter[str(row.chr_name).removeprefix("chr")][int(row.chr_position)])
         except KeyError:
             matches = set()
 
-        # Keep only one unambiguous destination on the autosomes used for scoring.
+        # Keeps only one unambiguous destination on the autosomes used for scoring.
         if len(matches) != 1:
             continue
+
+        # represent in GRCh38
         chromosome, position, _ = matches.pop()
         chromosome = str(chromosome).removeprefix("chr")
+
         if not chromosome.isdigit() or not 1 <= int(chromosome) <= 22:
             continue
+
         kept.append(index)
         coordinates.append((int(chromosome), int(position)))
 
     if not kept:
         raise ValueError("No unique autosomal GRCh38 mappings were found.")
 
-    # Preserve source IDs, allele labels and effects for cross-build source matching.
+    # Preserves rsIDs, allele labels and effects for cross-build source matching.
     lifted = weights.iloc[kept].copy()
     lifted["chr_name"], lifted["chr_position"] = zip(*coordinates)
+
     return lifted
 
 
+# Writes a PGS Catalog-format scoring file for pgsc_calc.
 def write_weights(weights, pgs_name, phenotype, output_dir, genome_build="GRCh37"):
 
     if not pgs_name or Path(pgs_name).name != pgs_name or any(char in pgs_name for char in "\n\r\t"):
@@ -83,16 +91,19 @@ def write_weights(weights, pgs_name, phenotype, output_dir, genome_build="GRCh37
         f"#variants_number={len(weights)}", "#weight_type=beta",
     ]
 
-    # Replace the score file only after writing the complete gzip.
+    # temp filename, replaces after complete gzip written.
     with NamedTemporaryFile(dir=destination.parent, prefix=".weights_", delete=False) as handle:
         temporary = Path(handle.name)
+
     try:
         with gzip.open(temporary, "wt", encoding="utf-8") as handle:
             handle.write("\n".join(metadata) + "\n")
             weights.to_csv(handle, sep="\t", index=False)
+
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
     return destination
 
 
@@ -104,15 +115,24 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--lift-over", action="store_true", help="Also write GRCh38 weights using 1-based coordinate conversion.")
     args = parser.parse_args()
+    print("Reading inferred SNP effects and preparing scoring files.", flush=True)
+
     try:
+
+        # Prepares native weights and the optional GRCh38 representation.
         weights = prepare_weights(args.input_file)
         lifted = liftover_weights(weights) if args.lift_over else None
+
+        # Writes one scoring file per genome build.
         destination = write_weights(weights, args.pgs_name, args.phenotype, args.output_dir)
+
         if lifted is not None:
             lifted_destination = write_weights(lifted, args.pgs_name, args.phenotype, args.output_dir, "GRCh38")
     except (OSError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
+
     print(f"Wrote {len(weights)} native GRCh37 weights to {destination}.")
+
     if lifted is not None:
         print(f"Wrote {len(lifted)} GRCh38 weights to {lifted_destination}; "
               f"omitted {len(weights) - len(lifted)} unmapped, ambiguous or non-autosomal rows.")

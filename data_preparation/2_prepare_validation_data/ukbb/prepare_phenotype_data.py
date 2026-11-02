@@ -29,23 +29,37 @@ ADJUSTED = {"LDL", "TC", "SBP", "DBP"}
 
 def prepare_phenotypes(tabular_file, withdrawals_file, medication_file, output_dir):
     columns = ["eid", "22001-0.0"] + list(PHENOTYPES) + COMPONENTS
+
     frame = pd.read_csv(tabular_file, usecols=columns, dtype={"eid": str})
     frame = frame.rename(columns={"eid": "IID", "22001-0.0": "Sex"})
     check_unique_ids(frame)
+
+    # Removes withdrawn participants.
     withdrawn = pd.read_csv(withdrawals_file, names=["IID"], dtype=str)
     frame = frame.loc[~frame["IID"].isin(withdrawn["IID"])].copy()
     frame["FID"] = frame["IID"]
+
+    # Reads medication use.
     medication = read_medication_use(medication_file)
+
+    # Phenotype output names.
     names = list(PHENOTYPES.values()) + [f"{name}_adj" for name in sorted(ADJUSTED)] + ["FEV1_FVC", "WHR"]
+
     output_dir = prepare_output_directory(output_dir)
 
     for field, name in PHENOTYPES.items():
         phenotype = frame[["FID", "IID", field]].rename(columns={field: "phenotype"}).copy()
+
+        # Transforms the designated traits before screening outliers.
         if name.startswith("LOG_"):
             phenotype["phenotype"] = np.log(phenotype["phenotype"])
+
+        # Screen outliers separately within each sex.
         outliers = detect_outliers(phenotype["phenotype"], stratify=frame["Sex"])
         phenotype.loc[outliers, "phenotype"] = np.nan
         write_phenotype(phenotype, output_dir, name)
+
+        # Writes the medication-adjusted phenotype.
         if name in ADJUSTED:
             write_phenotype(adjust_for_medication(phenotype, medication, name), output_dir, f"{name}_adj")
 
@@ -70,6 +84,7 @@ def main():
     parser.add_argument("--medication-file", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    print("Reading UKB phenotypes, exclusions and medication indicators.", flush=True)
     prepare_phenotypes(args.tabular_file, args.withdrawals_file, args.medication_file, args.output_dir)
 
 

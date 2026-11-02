@@ -1,200 +1,148 @@
-"""Construct fixed-width, 1-based inclusive windows from reference genotypes."""
+"""Define occupied genomic windows from the variants in reference genotype files.
+
+Positions and window boundaries are 1-based and inclusive. Only windows that
+contain reference variants receive an ID; shared UKB/CaG variants are assigned
+to these windows in the next script. Outputs tables that serve as useful reference 
+for assigning variants to windows, used for both UKB and CaG, using UKB GRch37 pos.
+"""
 
 import argparse
-from collections import defaultdict
 import gzip
+
 import pandas as pd
 
 
-# Open plain or gzip-compressed variant metadata.
-def _open_text(path: str):
-    if path.endswith(".gz"):
-        return gzip.open(path, "rt")
-    return open(path, "r")
-
-
-# Convert chromosome labels to integers.
+# Converts chromosome labels such as 'chr22' to integers.
 def _normalize_chr(series: pd.Series) -> pd.Series:
     return series.astype(str).str.replace(r"^chr", "", case=False, regex=True).astype(int)
 
 
-# Expand chromosome lists and ranges, removing duplicates.
+# Expands chromosome lists and ranges, removing duplicates.
 def _parse_chr_arg(chromosomes: str) -> list[int]:
     out = []
+
     for token in chromosomes.split(","):
         token = token.strip()
+
         if not token:
             continue
+
         if "-" in token:
             lo_s, hi_s = token.split("-", 1)
             lo, hi = int(lo_s), int(hi_s)
 
-            if lo > hi:
-                raise ValueError(f"Invalid range '{token}': start > end")
+            assert lo <= hi
 
             out.extend(range(lo, hi + 1))
         else:
             out.append(int(token))
 
-    if not out:
-        raise ValueError("No chromosomes parsed from --chromosomes")
+    assert out
 
     return sorted(set(out))
 
 
-def make_windows_from_bim(bim_path: str, mb_size: int) -> pd.DataFrame:
-    """Create occupied windows from BIM metadata.
+# Reads coordinates in chunks and counts reference variants in each occupied window.
+def make_windows(variant_path: str, window_size_bp: int, variant_format: str) -> pd.DataFrame:
+    summaries = []
+    opener = gzip.open if variant_path.endswith(".gz") else open
 
-    n_snps counts reference variant rows in each window.
-    """
-    variants = pd.read_csv(bim_path, sep=r"\s+", header=None,
-                           names=["CHR", "ID", "CM", "BP", "A1", "A2"],
-                           dtype={"CHR": str, "ID": str, "BP": int})
-    variants["CHR"] = _normalize_chr(variants["CHR"])
-    return make_windows_from_variants(variants[["CHR", "BP"]], mb_size)
+    with opener(variant_path, "rt") as handle:
 
+        # BIM has no header; PVAR starts with metadata followed by a #CHROM header.
+        if variant_format == "bim":
+            columns = ["CHR", "ID", "CM", "BP", "A1", "A2"]
+            chromosome_column, position_column = "CHR", "BP"
+        else:
+            for line in handle:
+                if line.startswith("#CHROM"):
+                    columns = line.split()
+                    break
+            else:
+                raise ValueError(f"Missing #CHROM/POS header in {variant_path}")
 
-def make_windows_from_pvar(pvar_path: str, mb_size: int) -> pd.DataFrame:
-    """Create occupied windows from plain or gzip-compressed PVAR metadata.
+            chromosome_column, position_column = "#CHROM", "POS"
 
-    n_snps counts reference variant rows in each window.
-    """
-    counts = defaultdict(int)
-    min_bp = {}
-    max_bp = {}
-    chrom_idx = None
-    pos_idx = None
+        reader = pd.read_csv(
+            handle, sep=r"\s+", names=columns,
+            usecols=[chromosome_column, position_column],
+            dtype={chromosome_column: str, position_column: int}, chunksize=500_000)
 
-    with _open_text(pvar_path) as handle:
-        for line in handle:
-            if line.startswith("##"):
-                continue
-            if line.startswith("#CHROM"):
-                header = line.rstrip("\n").split()
-                chrom_idx = header.index("#CHROM")
-                pos_idx = header.index("POS")
-                continue
+        for variants in reader:
+            variants = variants.rename(columns={chromosome_column: "CHR", position_column: "BP"})
+            variants["CHR"] = _normalize_chr(variants["CHR"])
 
-            if chrom_idx is None or pos_idx is None:
-                raise ValueError(f"Missing #CHROM/POS header in {pvar_path}")
-
-            fields = line.split()
-            chrom = int(fields[chrom_idx].removeprefix("chr").removeprefix("CHR"))
-            bp = int(fields[pos_idx])
-
-            if bp < 1:
+            if (variants["BP"] < 1).any():
                 raise ValueError("Variant positions must be positive and 1-based.")
 
-            window_id = (bp - 1) // mb_size
-            key = (chrom, window_id)
-            counts[key] += 1
-            min_bp[key] = bp if key not in min_bp else min(min_bp[key], bp)
-            max_bp[key] = bp if key not in max_bp else max(max_bp[key], bp)
+            # Position 1,000,000 belongs to the first 1-Mb window, not the second.
+            variants["window_id"] = (variants["BP"] - 1) // window_size_bp
+            grouped = variants.groupby(["CHR", "window_id"], sort=True)["BP"]
+            summaries.append(grouped.agg(n_snps="count", min_bp_obs="min", max_bp_obs="max"))
 
-    rows = []
-    for chrom, window_id in sorted(counts):
-        rows.append({"CHR": chrom, "window_id": window_id,
-                     "start_bp": window_id * mb_size + 1, "end_bp": (window_id + 1) * mb_size,
-                     "n_snps": counts[(chrom, window_id)],
-                     "min_bp_obs": min_bp[(chrom, window_id)],
-                     "max_bp_obs": max_bp[(chrom, window_id)]})
-    return pd.DataFrame(rows)
+    # A window may cross read chunks, so combine its counts and observed position range.
+    windows = pd.concat(summaries).groupby(level=["CHR", "window_id"], sort=True)
+    windows = windows.agg(n_snps=("n_snps", "sum"),
+                          min_bp_obs=("min_bp_obs", "min"), max_bp_obs=("max_bp_obs", "max"))
+    windows = windows.reset_index()
 
+    windows["start_bp"] = windows["window_id"] * window_size_bp + 1
+    windows["end_bp"] = (windows["window_id"] + 1) * window_size_bp
 
-def make_windows_from_variants(variants: pd.DataFrame, mb_size: int) -> pd.DataFrame:
-    """Create occupied windows from chromosome and position columns.
-
-    n_snps counts reference variant rows in each window.
-    """
-
-    variants = variants.copy()
-
-    if (variants["BP"] < 1).any():
-        raise ValueError("Variant positions must be positive and 1-based.")
-
-    # Subtract 1 so an exact upper boundary stays in the preceding 1-based window.
-    variants["window_id"] = (variants["BP"] - 1) // mb_size
-
-    grp = variants.groupby(["CHR", "window_id"], sort=True)["BP"]
-    out = grp.agg(n_snps="count", min_bp_obs="min", max_bp_obs="max").reset_index()
-
-    out["start_bp"] = out["window_id"] * mb_size + 1
-    out["end_bp"] = (out["window_id"] + 1) * mb_size
-
-    out = out[["CHR", "window_id", "start_bp", "end_bp", "n_snps", "min_bp_obs", "max_bp_obs"]]
-    return out
+    return windows[["CHR", "window_id", "start_bp", "end_bp", "n_snps", "min_bp_obs", "max_bp_obs"]]
 
 
-def make_windows_genomewide(variant_template: str, chromosomes: list[int], mb_size: int,
-                           variant_format: str) -> pd.DataFrame:
-    """Build chromosome windows and assign unique genome-wide window IDs.
-
-    variant_template includes '{chr}', e.g. data/ukbb/genotypes/chr{chr}.pvar
-    for PLINK2 PGEN metadata, or data/ukbb/genotypes/chr{chr}.bim for BED metadata.
-    Output columns:
-      CHR, window_id_chr, window_id_global, start_bp, end_bp, n_snps, min_bp_obs, max_bp_obs
-    n_snps counts reference variant rows in each window.
-    """
+# Number occupied windows across chromosomes in genomic order.
+def make_windows_genomewide(variant_template: str, chromosomes: list[int],
+                           window_size_bp: int, variant_format: str) -> pd.DataFrame:
 
     if "{chr}" not in variant_template:
         raise ValueError("Genome-wide template must include '{chr}' placeholder")
 
     frames = []
-    for chr_num in chromosomes:
-        variant_path = variant_template.format(chr=chr_num)
-        if variant_format == "bim":
-            df = make_windows_from_bim(variant_path, mb_size)
-        elif variant_format == "pvar":
-            df = make_windows_from_pvar(variant_path, mb_size)
-        else:
-            raise ValueError(f"Unsupported variant format: {variant_format}")
-        df = df.rename(columns={"window_id": "window_id_chr"})
-        frames.append(df)
 
-    out = pd.concat(frames, axis=0, ignore_index=True)
-    out = out.sort_values(["CHR", "window_id_chr"]).reset_index(drop=True)
-    out["window_id_global"] = out.index.astype(int)
+    for chromosome in chromosomes:
+        variant_path = variant_template.format(chr=chromosome)
+        print(f"chr{chromosome}: defining windows from {variant_path}.", flush=True)
+        windows = make_windows(variant_path, window_size_bp, variant_format)
+        frames.append(windows.rename(columns={"window_id": "window_id_chr"}))
 
-    out = out[["CHR", "window_id_chr", "window_id_global", "start_bp", "end_bp",
-               "n_snps", "min_bp_obs", "max_bp_obs"]]
-    return out
+    windows = pd.concat(frames, ignore_index=True)
+    windows = windows.sort_values(["CHR", "window_id_chr"]).reset_index(drop=True)
+    windows["window_id_global"] = windows.index.astype(int)
+
+    return windows[["CHR", "window_id_chr", "window_id_global", "start_bp", "end_bp",
+                    "n_snps", "min_bp_obs", "max_bp_obs"]]
 
 
-# Build windows from the selected reference files and save the table.
+# Choose one genotype metadata format and save its reference-window table.
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bim", help="Path to one chr_*.bim (single-chrom mode)")
-    ap.add_argument("--pvar", help="Path to one chr_*.pvar or .pvar.gz (single-chrom mode)")
-    ap.add_argument("--bim-template",
-                    help="Genome-wide mode template containing '{chr}', e.g. /path/chr_{chr}.bim")
-    ap.add_argument("--pvar-template",
-                    help="Genome-wide mode template containing '{chr}', e.g. /path/chr_{chr}.pvar")
-    ap.add_argument("--chromosomes", default="1-22",
-                    help="Comma/range list for genome-wide mode, e.g. '1-22' or '1,2,5-7'")
-    ap.add_argument("--out", required=True, help="Output TSV path")
-    ap.add_argument("--mb-size", type=int, default=1_000_000)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    inputs = parser.add_mutually_exclusive_group(required=True)
 
-    if args.mb_size < 1:
-        ap.error("--mb-size must be a positive width in base pairs.")
+    inputs.add_argument("--bim", help="BIM file for a single chromosome")
+    inputs.add_argument("--pvar", help="PVAR or PVAR.gz file for a single chromosome")
+    inputs.add_argument("--bim-template", help="BIM path containing '{chr}'")
+    inputs.add_argument("--pvar-template", help="PVAR path containing '{chr}'")
 
-    input_count = sum(x is not None for x in [args.bim, args.pvar, args.bim_template, args.pvar_template])
+    parser.add_argument("--chromosomes", default="1-22", help="Chromosomes, e.g. '1-22' or '1,2,5-7'")
+    parser.add_argument("--out", required=True, help="Output TSV path")
+    parser.add_argument("--mb-size", type=int, default=1_000_000, help="Window width in base pairs")
+    args = parser.parse_args()
 
-    if input_count != 1:
-        raise ValueError("Provide exactly one of --bim, --pvar, --bim-template, or --pvar-template")
+    assert args.mb_size >= 1
 
-    if args.bim is not None:
-        df = make_windows_from_bim(args.bim, args.mb_size)
-    elif args.pvar is not None:
-        df = make_windows_from_pvar(args.pvar, args.mb_size)
+    variant_format = "bim" if args.bim or args.bim_template else "pvar"
+    template = args.bim_template or args.pvar_template
+
+    if template:
+        chromosomes = _parse_chr_arg(args.chromosomes)
+        windows = make_windows_genomewide(template, chromosomes, args.mb_size, variant_format)
     else:
-        chrs = _parse_chr_arg(args.chromosomes)
-        if args.bim_template is not None:
-            df = make_windows_genomewide(args.bim_template, chrs, args.mb_size, "bim")
-        else:
-            df = make_windows_genomewide(args.pvar_template, chrs, args.mb_size, "pvar")
+        windows = make_windows(args.bim or args.pvar, args.mb_size, variant_format)
 
-    df.to_csv(args.out, sep="\t", index=False)
+    windows.to_csv(args.out, sep="\t", index=False)
+    print(f"Saved {len(windows):,} reference windows to {args.out}.", flush=True)
 
 
 if __name__ == "__main__":

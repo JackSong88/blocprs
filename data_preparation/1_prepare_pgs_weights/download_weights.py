@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import urllib.request
 
+from tqdm import tqdm
+
 
 def read_pgs_ids(pgs_ids=None, pgs_table=None):
     if pgs_table is not None:
@@ -17,6 +19,7 @@ def read_pgs_ids(pgs_ids=None, pgs_table=None):
             rows = csv.DictReader(handle)
             pgs_ids = [row["PGSCatalog_ID"] for row in rows if row["PGSCatalog_ID"]]
 
+    # Removes repeated IDs while preserving panel order.
     pgs_ids = list(dict.fromkeys(str(value).strip() for value in pgs_ids if str(value).strip()))
 
     if not pgs_ids or any(re.fullmatch(r"PGS[0-9]{6}", value) is None for value in pgs_ids):
@@ -25,11 +28,12 @@ def read_pgs_ids(pgs_ids=None, pgs_table=None):
     return pgs_ids
 
 
-# Download to a temporary filename so interrupted transfers are not treated as complete.
+# Downloads to a temporary filename so interrupted transfers are not treated as complete.
 def download_file(url, destination):
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".part")
+
     try:
         urllib.request.urlretrieve(url, temporary)
         temporary.replace(destination)
@@ -41,17 +45,30 @@ def download_weights(pgs_ids, builds, output_dir):
     builds = list(dict.fromkeys(builds))
     output_dir = Path(output_dir)
     count = 0
-    for pgs_id in dict.fromkeys(pgs_ids):
-        pending = [build for build in builds if not (output_dir / build / f"{pgs_id}.txt.gz").is_file()]
-        if not pending:
-            continue
-        with urllib.request.urlopen(f"https://www.pgscatalog.org/rest/score/{pgs_id}", timeout=60) as response:
-            metadata = json.load(response)
+    skipped = 0
 
-        for build in pending:
-            url = metadata["ftp_harmonized_scoring_files"][build]["positions"]
-            download_file(url, output_dir / build / f"{pgs_id}.txt.gz")
-            count += 1
+    with tqdm(list(dict.fromkeys(pgs_ids)), desc="PGS downloads", unit="PRS") as progress:
+        for pgs_id in progress:
+
+            # Request only the genome builds not already downloaded.
+            pending = [build for build in builds if not (output_dir / build / f"{pgs_id}.txt.gz").is_file()]
+            skipped += len(builds) - len(pending)
+            progress.set_postfix_str(f"{pgs_id}; downloaded={count}, skipped={skipped}")
+
+            if not pending:
+                continue
+
+            with urllib.request.urlopen(f"https://www.pgscatalog.org/rest/score/{pgs_id}", timeout=60) as response:
+                metadata = json.load(response)
+
+            for build in pending:
+                progress.set_postfix_str(f"{pgs_id} {build}; downloaded={count}, skipped={skipped}")
+                url = metadata["ftp_harmonized_scoring_files"][build]["positions"]
+                download_file(url, output_dir / build / f"{pgs_id}.txt.gz")
+                count += 1
+
+            progress.set_postfix_str(f"downloaded={count}, skipped={skipped}")
+
     return count
 
 
@@ -70,7 +87,8 @@ def main():
         count = download_weights(pgs_ids, args.builds, args.output_dir)
     except (OSError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
-    print(f"Downloaded {count} new scoring files to {args.output_dir}; existing files were skipped.")
+
+    print(f"Downloaded {count} new scoring files to {args.output_dir}; existing files were skipped.", flush=True)
 
 
 if __name__ == "__main__":

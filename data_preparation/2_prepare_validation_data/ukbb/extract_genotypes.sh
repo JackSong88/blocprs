@@ -4,24 +4,28 @@
 # Modified for BLocPRS.
 
 #SBATCH --job-name=blocprs_ukbb_extract
+#SBATCH --account=def-liyue
 #SBATCH --array=1-22
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=72G
 #SBATCH --time=14:00:00
-#SBATCH --output=blocprs_ukbb_extract_%A_%a.log
+#SBATCH --output=log/blocprs_ukbb_extract_%A_%a.log
 
 set -euo pipefail
 
+module load plink
+
 chrom="${1:-${SLURM_ARRAY_TASK_ID:-1}}"
-output_prefix="data/ukbb/genotypes/chr${chrom}"
+output_prefix="${2:-data/ukbb/genotypes/chr${chrom}}"
 
 mkdir -p "$(dirname "$output_prefix")"
 
-plink2 --bgen "data/ukbb/raw/genotypes/chr${chrom}.bgen" ref-first \
-  --sample "data/ukbb/raw/genotypes/chr${chrom}.sample" \
+# Extracts the selected participants and source-PRS variant positions.
+plink2 --bgen "/project/rpp-aevans-ab/neurohub/UKB/Bulk/Imputation/UKB_imputation_from_genotype/ukb22828_c${chrom}_b0_v3.bgen" ref-first \
+  --sample "/project/rpp-aevans-ab/neurohub/UKB/Bulk/Imputation/UKB_imputation_from_genotype/ukb22828_c${chrom}_b0_v3.sample" \
   --make-pgen \
   --threads "${SLURM_CPUS_PER_TASK:-4}" \
-  --memory 64000 \
+  --memory "${PLINK_MEMORY_MB:-64000}" \
   --allow-no-sex \
   --max-alleles 2 \
   --keep "data/ukbb/participants.keep" \

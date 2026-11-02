@@ -19,8 +19,11 @@ def extract_medication_data(metadata_file, output):
                "HIGH_BP_CURRENTLY_TREATED": "bp_med"}
     frame = pd.read_csv(metadata_file, usecols=list(columns), dtype={"file111": str}).rename(columns=columns)
     check_unique_ids(frame)
+
     frame["chol_med"] = frame["chol_med"].eq(1)
     frame["bp_med"] = frame["bp_med"].eq(1)
+
+    # Saves participant-level medication indicators.
     output = Path(output)
     prepare_output_directory(output.parent)
     frame[["IID", "chol_med", "bp_med"]].to_csv(output, sep="\t", index=False)
@@ -32,6 +35,7 @@ def main():
     parser.add_argument("--metadata-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    print("Reading CaG medication records.", flush=True)
     extract_medication_data(args.metadata_file, args.output)
 
 

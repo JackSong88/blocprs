@@ -1,12 +1,16 @@
 #!/bin/bash
 
 #SBATCH --job-name=blocprs_score
+#SBATCH --account=def-liyue
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=40G
 #SBATCH --time=08:00:00
-#SBATCH --output=blocprs_score_%j.log
+#SBATCH --output=log/blocprs_score_%j.log
 
 set -euo pipefail
+
+module load plink
+source env/blocprs/bin/activate
 
 cohort=${1:?Specify UKB or CaG, followed by the chromosome scorefiles.}
 shift
@@ -37,6 +41,7 @@ mkdir -p "$output"
 
 for score in "$@"; do
   name=$(basename "$score" .scorefile.gz)
+  printf 'Scoring %s: %s\n' "$sampleset" "$name"
 
   if [[ ! "$name" =~ ^(ukbb|cartagene)_([0-9]+)_additive_([0-9]+)_(w[0-9]+|fullchr)$ ]]; then
     echo "Unexpected scorefile name: $name" >&2
@@ -48,6 +53,8 @@ for score in "$@"; do
   [[ "${BASH_REMATCH[1]}" == "$sampleset" ]] || { echo "Scorefile cohort differs from $cohort." >&2; exit 1; }
 
   prefix="$output/$name"
+
+  # The first two columns identify the variant and counted allele; the rest are PRS weights.
   n_columns=$(python - "$score" <<'PY'
 import gzip
 import sys
@@ -58,7 +65,8 @@ PY
 
   [[ "$n_columns" -ge 3 ]] || { echo "No source weights in $score" >&2; exit 1; }
 
-  # SUM, not AVG: scores must add across windows.
+  # Uses the reference allele frequencies for missing genotypes in both biobanks.
+  # Saves SUM scores so adding the windows reconstructs the genome-wide PRS.
   plink2 --pfile "${genotype_dir}/chr${chrom}" \
     --threads "${SLURM_CPUS_PER_TASK:-4}" --memory "${PLINK_MEMORY_MB:-36000}" \
     --seed 31 --allow-extra-chr \
@@ -67,3 +75,5 @@ PY
     --score "$score" 1 2 zs header-read cols=+scoresums,+denom,+fid list-variants \
     --score-col-nums "3-$n_columns" --out "$prefix"
 done
+
+printf 'Scoring complete: %s\n' "$output"

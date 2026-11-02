@@ -1,4 +1,9 @@
-"""Combine PLINK SUM scores from canonical scorefiles into a raw binary score bundle."""
+"""Collects PLINK score sums into a participants x windows x PRSs array
+used for downstream data creation.
+
+Reads scores in chunks, saves completed window blocks for interrupted runs,
+and writes scores.npy with participant and PRS labels for dataset creation.
+"""
 
 import argparse
 import errno
@@ -7,25 +12,39 @@ import gzip
 import json
 import re
 import shutil
+import sys
 import tempfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 
 import numpy as np
 import pandas as pd
-
-import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from canonical_transfer_utils import normalize_accession, parse_chromosomes
 
-
+# Saves up to 32 windows per block so completed extraction work can be reused after interruption.
 WINDOWS_PER_BLOCK = 32
+
+# Caps the input and converted-output buffers together at 64 MiB (64 x 1024 x 1024 bytes).
 OUTPUT_BUFFER_BYTES = 64 * 1024**2
 
 
-# Derive expected result files from the scoring inputs, not from whichever outputs exist.
+# Describes a scoring result and the PRSs expected from its original weight file.
+@dataclass
+class ScoreFile:
+    path: Path
+    window: int | None
+    sources: list[str]
+    cohort: str
+    chromosome: int
+
+
+# Finds the PLINK scores for one additive_0, additive_1, etc. weight file.
+# Returns the PRS names and window/chromosome labels used to group those scores.
 def scorefile_info(path, score_dir):
     match = re.fullmatch(r"(ukbb|cartagene)_([0-9]+)_additive_([0-9]+)_(w([0-9]+)|fullchr)\.scorefile\.gz", path.name)
 
@@ -41,80 +60,63 @@ def scorefile_info(path, score_dir):
 
     with gzip.open(path, "rt") as handle:
         columns = handle.readline().rstrip("\r\n").split("\t")[2:]
+
     sources = [normalize_accession(column) for column in columns]
 
     if not sources or len(set(sources)) != len(sources):
         raise ValueError(f"Invalid source columns in {path}.")
 
     window = None if match[5] is None else int(match[5])
-    return present[0], window, sources, match[1], int(match[2])
+    return ScoreFile(present[0], window, sources, match[1], int(match[2]))
 
 
-# Match requested sources to their raw SUM columns.
+# Finds the SUM column for each requested PRS.
 def score_columns(path, requested, expected):
     header = pd.read_csv(path, sep=r"\s+", nrows=0).columns
     fid_column = "#FID" if "#FID" in header else "FID"
     selected = {}
+
     for column in header:
-        if column.endswith("_SUM"):
-            source = normalize_accession(column[:-4])
-            if source in requested:
 
-                if source in selected.values():
-                    raise ValueError(f"Duplicate SUM columns for {source} in {path}.")
+        if not column.endswith("_SUM"):
+            continue
 
-                selected[column] = source
-    needed = set(expected) & set(requested)
+        source = normalize_accession(column[:-4])
 
-    if needed != set(selected.values()):
+        if source not in requested:
+            continue
+
+        if source in selected.values():
+            raise ValueError(f"Duplicate SUM columns for {source} in {path}.")
+
+        selected[column] = source
+
+    if (set(expected) & set(requested)) != set(selected.values()):
         raise ValueError(f"SUM columns do not match the supplied scorefile: {path}")
 
     return fid_column, selected
 
 
-# Read bounded participant chunks; other PLINK output columns are not retained.
+# Reads participant rows in chunks and keeps only IDs and the requested PRS sums.
 def score_chunks(path, requested, expected, block_size):
     fid_column, selected = score_columns(path, requested, expected)
+    present = list(selected.values())
     dtype = {fid_column: str, "IID": str, **{column: np.float64 for column in selected}}
     reader = pd.read_csv(path, sep=r"\s+", usecols=[fid_column, "IID", *selected],
                          dtype=dtype, chunksize=block_size)
 
     with reader:
         for frame in reader:
-            frame = frame.rename(columns={fid_column: "FID", **selected})
-
-            if frame[["FID", "IID"]].isna().any().any():
-                raise ValueError(f"Missing participant IDs in {path}.")
-
-            if not np.isfinite(frame[list(selected.values())].to_numpy(dtype=float)).all():
-                raise ValueError(f"Missing or nonfinite scores in {path}; no participant zero-filling is allowed.")
-
-            yield frame, list(selected.values())
+            frame.rename(columns={fid_column: "FID", **selected}, inplace=True)
+            yield frame, present
 
 
-# Retain the full-table interface used by the independent window-sum checker.
-def load_scores(path, requested, expected):
-    frames = []
-    present = []
-    for frame, present in score_chunks(path, requested, expected, 65536):
-        frames.append(frame)
-
-    if not frames:
-        raise ValueError(f"No participants in {path}.")
-
-    frame = pd.concat(frames, ignore_index=True)
-    ids = pd.MultiIndex.from_frame(frame[["FID", "IID"]])
-
-    if frame.empty or ids.has_duplicates or frame[["FID", "IID"]].isna().any().any():
-        raise ValueError(f"Missing or duplicate participants in {path}.")
-
-    return frame, ids, present
-
-
-# Read and validate the shared participant order once.
+# Reads IDs from the first scoring result to establish the participant order
+# that every subsequent scoring result must match.
 def reference_participants(path, block_size):
     header = pd.read_csv(path, sep=r"\s+", nrows=0).columns
     fid_column = "#FID" if "#FID" in header else "FID"
+
     with pd.read_csv(path, sep=r"\s+", usecols=[fid_column, "IID"], dtype=str,
                      chunksize=block_size) as reader:
         frames = [frame.rename(columns={fid_column: "FID"})[["FID", "IID"]] for frame in reader]
@@ -124,26 +126,28 @@ def reference_participants(path, block_size):
 
     ids = pd.concat(frames, ignore_index=True)
     validate_participants(ids)
+
     return ids
 
 
-# Duplicate IDs are checked globally, including across reading chunks.
+# Checks all participant IDs for missing values and duplicates across chunks.
 def validate_participants(ids):
-
     if ids.empty or ids.isna().any().any() or pd.MultiIndex.from_frame(ids).has_duplicates:
         raise ValueError("Missing or duplicate participant IDs.")
 
 
-# Record input identity for checkpoint reuse without hashing large scoring files.
+# Records input file details to check before reusing saved extraction blocks.
 def file_signature(path):
     path = path.resolve()
     stat = path.stat()
+
     return [str(path), stat.st_size, stat.st_mtime_ns]
 
 
-# Publish on the destination filesystem, even when temporary files are stored elsewhere.
-def publish_file(source, destination):
+# Moves a completed file into place; copies it when working and output folders are on different disks.
+def save_completed_file(source, destination):
     partial = destination.with_name(destination.name + ".partial")
+
     try:
         source.replace(partial)
     except OSError as error:
@@ -152,55 +156,73 @@ def publish_file(source, destination):
             raise
 
         shutil.copyfile(source, partial)
+
     partial.replace(destination)
 
 
-# Accumulate neighbouring window/source columns in a small column-major block.
+# Sums additive_0, additive_1, etc. scores for each participant, window and PRS.
+# Saves the completed block so an interrupted extraction can reuse it.
 def build_block(records, sources, windows, ids_frame, block_size, work_dir, destination):
     source_index = {source: index for index, source in enumerate(sources)}
     window_index = {window: index for index, window in enumerate(windows)}
-    reference_ids = ids_frame.to_numpy()
+    reference_fid = ids_frame["FID"].to_numpy()
+    reference_iid = ids_frame["IID"].to_numpy()
+
+    # Removes an unfinished working file left by an interrupted run.
     path = work_dir / "blocprs_extract.working.npy"
     path.unlink(missing_ok=True)
-    required_bytes = len(ids_frame) * len(sources) * len(windows) * 8 + 4096
-
-    if shutil.disk_usage(work_dir).free < required_bytes:
-        raise ValueError(f"Not enough working space in {work_dir}; this block needs {required_bytes / 1024**3:.2f} GiB.")
 
     try:
-
-        # Column-major storage makes each source/window update contiguous on disk.
+        # Stores all participants together for each window/PRS. This matches the
+        # order read from PLINK and avoids scattered writes across a large array.
         scores = np.lib.format.open_memmap(path, mode="w+", dtype=np.float64,
-                                          shape=(len(ids_frame), len(sources) * len(windows)), fortran_order=True)
+                                          shape=(len(ids_frame), len(windows), len(sources)), fortran_order=True)
         try:
             scores[:] = 0
-            for score_path, window, expected, _, _ in records:
+            last_report = monotonic()
+
+            for number, record in enumerate(records, start=1):
                 start = 0
-                for frame, present in score_chunks(score_path, sources, expected, block_size):
+                window_position = window_index[record.window]
+
+                for frame, present in score_chunks(record.path, sources, record.sources, block_size):
                     stop = start + len(frame)
 
-                    if not np.array_equal(frame[["FID", "IID"]].to_numpy(), reference_ids[start:stop]):
-                        raise ValueError(f"Participant order/membership differs in {score_path}; align before extraction.")
+                    if (not np.array_equal(frame["FID"].to_numpy(), reference_fid[start:stop])
+                        or not np.array_equal(frame["IID"].to_numpy(), reference_iid[start:stop])):
+                        raise ValueError(f"Participant order/membership differs in {record.path}; align before extraction.")
 
                     for source in present:
-                        column = source_index[source] * len(windows) + window_index[window]
+                        values = frame[source].to_numpy(dtype=np.float64)
 
-                        # Sum additive partitions in float64 rather than averaging them.
-                        scores[start:stop, column] += frame[source].to_numpy(dtype=np.float64)
+                        if not np.isfinite(values).all():
+                            raise ValueError(f"Missing or nonfinite scores in {record.path}")
+
+                        # Sums this PRS's contributions from additive_0, additive_1, etc.
+                        prs_position = source_index[source]
+                        scores[start:stop, window_position, prs_position] += values
+
                     start = stop
 
-                if start != len(reference_ids):
-                    raise ValueError(f"Participant count differs in {score_path}.")
+                    now = monotonic()
+                    if now - last_report >= 30:
+                        print(f"Summing file {number}/{len(records)} in this block: "
+                              f"{stop:,}/{len(ids_frame):,} participant rows.", flush=True)
+                        last_report = now
+
+                if start != len(ids_frame):
+                    raise ValueError(f"Participant count differs in {record.path}.")
 
             scores.flush()
         finally:
             del scores
-        publish_file(path, destination)
+
+        save_completed_file(path, destination)
     finally:
         path.unlink(missing_ok=True)
 
 
-# Only complete blocks with the expected layout can be reused.
+# Checks whether a saved extraction block has the expected format and can be reused.
 def complete_block(path, shape):
     try:
         values = np.load(path, mmap_mode="r", allow_pickle=False)
@@ -211,20 +233,19 @@ def complete_block(path, shape):
         return False
 
 
-# Copy contiguous source/window slabs, releasing both mappings after each bounded chunk.
+# Joins completed window blocks without loading the full array into memory.
 def write_output(block_paths, groups, sources, windows, ids_frame, output, block_size, *, dtype=np.float32):
-
-    if output.exists() or output.is_symlink():
-        raise FileExistsError(f"Output already exists: {output}")
 
     dtype = np.dtype(dtype)
     n_participants = len(ids_frame)
     values_per_chunk = max(1, min(block_size * WINDOWS_PER_BLOCK,
                                   OUTPUT_BUFFER_BYTES // (np.dtype(np.float64).itemsize + dtype.itemsize)))
+
     features = [("genomewide" if window is None else f"w{window:04d}", source,
                  source if window is None else f"{source}_w{window:04d}")
                 for window in windows for source in sources]
 
+    # Writes the score array and labels together before moving to the final directory.
     with tempfile.TemporaryDirectory(prefix=f".{output.name}.", suffix=".partial", dir=output.parent) as directory:
         temporary_output = Path(directory)
         scores_path = temporary_output / "scores.npy"
@@ -233,44 +254,55 @@ def write_output(block_paths, groups, sources, windows, ids_frame, output, block
         output_offset = scores.offset
         scores.flush()
         del scores
+
         window_start = 0
+        started = last_report = monotonic()
+        written = 0
+        total_values = n_participants * len(windows) * len(sources)
+
         for path, group in zip(block_paths, groups):
             block = np.load(path, mmap_mode="r", allow_pickle=False)
             input_offset = block.offset
             del block
-            width = len(group)
-            for source_index in range(len(sources)):
 
-                # Input: (participant, source * block_width + local_window), Fortran order.
-                # Output: (participant, global_window, source), Fortran order.
-                input_start = source_index * width * n_participants
-                output_start = (source_index * len(windows) + window_start) * n_participants
-                for start in range(0, n_participants * width, values_per_chunk):
-                    count = min(values_per_chunk, n_participants * width - start)
-                    values = np.memmap(path, mode="r", dtype=np.float64,
-                                       offset=input_offset + (input_start + start) * 8, shape=(count,))
-                    try:
+            # Reads each PRS's adjacent participant-by-window values in order.
+            # Seeks to that PRS's first window in the final array.
+            with path.open("rb") as input_file, scores_path.open("r+b") as output_file:
+                input_file.seek(input_offset)
+                values_per_source = n_participants * len(group)
 
-                        if not np.isfinite(values).all():
-                            raise ValueError("Nonfinite scores in an accumulated block; final output was not published.")
+                for source_index in range(len(sources)):
+                    output_start = (source_index * len(windows) + window_start) * n_participants
+                    output_file.seek(output_offset + output_start * dtype.itemsize)
 
-                        target = np.memmap(scores_path, mode="r+", dtype=dtype,
-                                           offset=output_offset + (output_start + start) * dtype.itemsize, shape=(count,))
-                        try:
+                    for start in range(0, values_per_source, values_per_chunk):
+                        count = min(values_per_chunk, values_per_source - start)
+                        values = np.fromfile(input_file, dtype=np.float64, count=count)
 
-                            # Convert precision only after the float64 partition sums are complete.
-                            with np.errstate(over="ignore", invalid="ignore"):
-                                target[:] = values
+                        if len(values) != count:
+                            raise ValueError(f"Incomplete saved score block: {path}")
 
-                            if not np.isfinite(target).all():
-                                raise ValueError("Scores overflowed the output dtype; final output was not published.")
+                        # Converts only after adding all partitions and rejects overflow
+                        # from either summation or float32 conversion.
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            converted = values.astype(dtype)
 
-                            target.flush()
-                        finally:
-                            del target
-                    finally:
-                        del values
-            window_start += width
+                        if not np.isfinite(converted).all():
+                            raise ValueError("Nonfinite scores after conversion; final output was not saved.")
+
+                        converted.tofile(output_file)
+                        del values, converted
+
+                        written += count
+                        now = monotonic()
+                        if now - last_report >= 30 or written == total_values:
+                            print(f"Writing scores.npy: {100 * written / total_values:.1f}%; "
+                                  f"elapsed={now - started:.1f}s.", flush=True)
+                            last_report = now
+
+            window_start += len(group)
+
+        # Saves labels in the same participant, window and source order.
         ids_frame[["FID", "IID"]].to_csv(temporary_output / "participants.tsv", sep="\t", index=False)
         pd.DataFrame(features, columns=["window", "source", "column"]).to_csv(
             temporary_output / "features.tsv", sep="\t", index=False)
@@ -281,78 +313,31 @@ def write_output(block_paths, groups, sources, windows, ids_frame, output, block
         temporary_output.rename(output)
 
 
-# Reuse completed blocks after interruption and remove them after successful output.
-def extract_scores(scorefiles, score_dir, sources, output, block_size=65536, chromosomes=None,
-                   tmp_dir=Path("data/tmp/extract_scores"), work_dir=None):
-
-    if not sources or len(set(sources)) != len(sources) or len(set(scorefiles)) != len(scorefiles):
-        raise ValueError("Provide unique source names and scorefiles.")
-
-    if not scorefiles or block_size < 1:
-        raise ValueError("Provide a nonempty scorefile list and positive block size.")
-
-    if output.exists() or output.is_symlink():
-        raise FileExistsError(f"Output already exists: {output}")
-
-    info = [scorefile_info(path, score_dir) for path in scorefiles]
-
-    if chromosomes is not None and {row[4] for row in info} != set(chromosomes):
-        raise ValueError("Supplied scorefiles do not cover exactly the requested chromosomes.")
-
-    if len({path for path, *_ in info}) != len(info) or len({row[3] for row in info}) != 1:
-        raise ValueError("Scoring inputs must refer to distinct outputs from one cohort.")
-
-    full = all(window is None for _, window, *_ in info)
-
-    if not full and any(window is None for _, window, *_ in info):
-        raise ValueError("Do not combine windowed and whole-chromosome scoring inputs.")
-
-    windows = [None] if full else sorted({window for _, window, *_ in info})
-    if not full:
-        for window in windows:
-
-            if len({row[4] for row in info if row[1] == window}) != 1:
-                raise ValueError("Window IDs must be genome-wide unique.")
-
-    available = set().union(*(set(row[2]) for row in info))
-
-    if set(sources) - available:
-        raise ValueError(f"Requested sources absent from all inputs: {set(sources) - available}")
-
-    # Keep the full window layout, but do not parse irrelevant participant scores.
-    relevant = [row for row in info if set(row[2]) & set(sources)]
-    groups = [windows[start:start + WINDOWS_PER_BLOCK] for start in range(0, len(windows), WINDOWS_PER_BLOCK)]
-    tmp_dir = Path(tmp_dir)
-    work_dir = tmp_dir if work_dir is None else Path(work_dir)
-
-    if output.resolve().is_relative_to(tmp_dir.resolve()) or output.resolve().is_relative_to(work_dir.resolve()):
-        raise ValueError("Keep the final output outside the temporary and working directories.")
-
-    if output.resolve() in {path.resolve() for path in [*scorefiles, *(row[0] for row in info)]}:
-        raise ValueError("The final output must not replace a scoring input.")
-
-    output.parent.mkdir(parents=True, exist_ok=True)
+# Prepares saved input details, participant IDs and block paths for a new or resumed run.
+# Locks the temporary directories and removes checkpoints only after successful output.
+@contextmanager
+def extraction_checkpoint(tmp_dir, work_dir, state, n_blocks, reference_file, block_size):
     tmp_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
-    block_paths = [tmp_dir / f"block_{index:05d}.npy" for index in range(len(groups))]
+    block_paths = [tmp_dir / f"block_{index:05d}.npy" for index in range(n_blocks)]
     state_path, ids_path = tmp_dir / "state.json", tmp_dir / "ids.tsv"
-    state = {"version": 1, "output": str(output.resolve()), "sources": list(sources),
-             "windows": windows, "windows_per_block": WINDOWS_PER_BLOCK,
-             "inputs": [[file_signature(path), file_signature(row[0])] for path, row in zip(scorefiles, info)]}
 
-    # Lock both directories; retain empty lock files so retries lock the same file.
+    # Protects saved blocks and the working file when another run uses either directory.
     lock_paths = [tmp_dir / ".lock"]
+
     if work_dir.resolve() != tmp_dir.resolve():
         lock_paths.append(work_dir / ".lock")
 
     with ExitStack() as locks:
         for path in lock_paths:
             lock = locks.enter_context(path.open("a"))
+
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise ValueError(f"Another extraction is using {path.parent}; choose a separate temporary directory.") from error
 
+        # Reuses blocks only when the input files, PRSs and window order still match.
         if state_path.exists():
 
             if json.loads(state_path.read_text()) != state:
@@ -367,6 +352,7 @@ def extract_scores(scorefiles, score_dir, sources, output, block_size=65536, chr
             partial.write_text(json.dumps(state))
             partial.replace(state_path)
 
+        # Restores the participant order used by saved blocks, or reads it from the first score file.
         if ids_path.exists():
             ids_frame = pd.read_csv(ids_path, sep="\t", dtype=str)
             validate_participants(ids_frame)
@@ -375,33 +361,111 @@ def extract_scores(scorefiles, score_dir, sources, output, block_size=65536, chr
             if any(path.exists() for path in block_paths):
                 raise ValueError("Checkpoint participant IDs are missing; use a new --tmp-dir.")
 
-            ids_frame = reference_participants(relevant[0][0], block_size)
+            ids_frame = reference_participants(reference_file, block_size)
             partial = ids_path.with_suffix(".tsv.partial")
             ids_frame.to_csv(partial, sep="\t", index=False)
             partial.replace(ids_path)
 
+        # Keeps both locks held while extract_scores builds blocks and writes the output.
+        yield ids_frame, block_paths
+
+        # Runs only after successful output; leaves unrelated temporary files untouched.
+        for path in [*block_paths, ids_path, state_path]:
+            path.unlink()
+            path.with_name(path.name + ".partial").unlink(missing_ok=True)
+
+        (work_dir / "blocprs_extract.working.npy").unlink(missing_ok=True)
+
+
+# Collects PLINK scores into one participant x window x PRS dataset.
+# Saves completed blocks so an interrupted extraction can resume.
+def extract_scores(scorefiles, score_dir, sources, output, block_size=65536, chromosomes=None,
+                   tmp_dir=Path("data/tmp/extract_scores"), work_dir=None):
+
+    if len(set(sources)) != len(sources):
+        raise ValueError("Provide unique source names.")
+
+    assert block_size >= 1
+
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"Output already exists: {output}")
+
+    # Matches each weight file to its PLINK output and reads the PRS names.
+    print(f"Reading score headers and locating {len(scorefiles):,} PLINK outputs.", flush=True)
+    results = [scorefile_info(path, score_dir) for path in scorefiles]
+
+    if chromosomes is not None and {record.chromosome for record in results} != set(chromosomes):
+        raise ValueError("Supplied scorefiles do not cover exactly the requested chromosomes.")
+
+    if len({record.path for record in results}) != len(results) or len({record.cohort for record in results}) != 1:
+        raise ValueError("Scoring inputs must refer to distinct outputs from one cohort.")
+
+    # Windowed inputs stay separate; full-chromosome inputs sum into one genome-wide score per PRS.
+    full = all(record.window is None for record in results)
+
+    if not full and any(record.window is None for record in results):
+        raise ValueError("Do not combine windowed and whole-chromosome scoring inputs.")
+
+    windows = [None] if full else sorted({record.window for record in results})
+
+    #each ID should belong to only one chr
+    if not full:
+        for window in windows:
+            if len({record.chromosome for record in results if record.window == window}) != 1:
+                raise ValueError("Window IDs must be genome-wide unique.")
+
+    requested = set(sources)
+    available = set().union(*(record.sources for record in results))
+    missing = requested - available
+
+    if missing:
+        raise ValueError(f"Requested sources absent from all inputs: {missing}")
+
+    # Reads only files containing a requested PRS, but retains the full window list.
+    # A window without variants for these PRSs stays in the output with zero scores.
+    relevant = [record for record in results if set(record.sources) & requested]
+    groups = [windows[start:start + WINDOWS_PER_BLOCK] for start in range(0, len(windows), WINDOWS_PER_BLOCK)] # divide window list into blocks
+
+    tmp_dir = Path(tmp_dir)
+    work_dir = tmp_dir if work_dir is None else Path(work_dir)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    # Records input details and output ordering so saved blocks cannot be reused for a different extraction.
+    state = {"version": 2, "output": str(output.resolve()), "sources": list(sources),
+             "windows": windows, "windows_per_block": WINDOWS_PER_BLOCK,
+             "inputs": [[file_signature(path), file_signature(record.path)] for path, record in zip(scorefiles, results)]}
+
+    # Restores the participant order and saved-block paths, or prepares them for a new run.
+    with extraction_checkpoint(tmp_dir, work_dir, state, len(groups), relevant[0].path, block_size) as (ids_frame, block_paths):
         print(f"Extracting {len(ids_frame):,} participants, {len(sources)} sources, {len(groups)} blocks.", flush=True)
+
+        # Processes all participants and requested PRSs for one group of windows at a time.
         for index, (group, destination) in enumerate(zip(groups, block_paths)):
-            shape = (len(ids_frame), len(sources) * len(group))
+            shape = (len(ids_frame), len(group), len(sources))
+
+            # A completed block stores every participant-window-PRS score for this group.
+            # Reuses that saved array instead of repeating the extraction and summation.
             reused = complete_block(destination, shape)
 
             if not reused:
-                records = [row for row in relevant if row[1] in group]
+
+                # Selects the scoring files for this group's windows.
+                records = [record for record in relevant if record.window in group]
+
+                # Sums additive_0, additive_1, etc. for every participant-window-PRS combination
+                # in this group, checks participant order, and saves the results as a reusable block.
                 build_block(records, sources, group, ids_frame, block_size, work_dir, destination)
 
             print(f"Block {index + 1}/{len(groups)}: {'reused' if reused else 'saved'}.", flush=True)
 
-        if state["inputs"] != [[file_signature(path), file_signature(row[0])] for path, row in zip(scorefiles, info)]:
-            raise ValueError("Scoring inputs changed during extraction; final output was not replaced.")
+        # Checks again because upstream score files can change while extraction runs.
+        if state["inputs"] != [[file_signature(path), file_signature(record.path)] for path, record in zip(scorefiles, results)]:
+            raise ValueError("Scoring inputs changed during extraction; final output was not saved.")
 
-        print("Writing binary score bundle.", flush=True)
+        # Assembles the saved blocks into scores.npy, keeping windows and PRSs separate.
+        # Also saves the participant IDs and window/PRS labels in the matching order.
+        print("Writing score array and participant/PRS labels.", flush=True)
         write_output(block_paths, groups, sources, windows, ids_frame, output, block_size)
-
-        # Remove only this extractor's checkpoints, not unrelated files in --tmp-dir.
-        for path in [*block_paths, ids_path, state_path]:
-            path.unlink()
-            path.with_name(path.name + ".partial").unlink(missing_ok=True)
-        (work_dir / "blocprs_extract.working.npy").unlink(missing_ok=True)
 
     print(f"Wrote {len(ids_frame):,} participants x {len(sources) * len(windows):,} scores to {output}.", flush=True)
 
@@ -418,6 +482,7 @@ def main():
     parser.add_argument("--work-dir", type=Path, help="Optional working directory, e.g. node-local storage; defaults to --tmp-dir.")
     parser.add_argument("--chromosomes", default="1-22", help="Expected chromosome coverage, e.g. 1-22 or 1.")
     args = parser.parse_args()
+
     chromosomes = [int(value) for value in parse_chromosomes(args.chromosomes)]
     extract_scores(args.scorefiles, args.score_dir, args.sources, args.out, args.block_size, chromosomes,
                    args.tmp_dir, args.work_dir)

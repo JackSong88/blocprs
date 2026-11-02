@@ -41,14 +41,22 @@ ADJUSTED = {"LDL", "TC", "SBP", "DBP"}
 
 def continuous_phenotype(frame, field, name, limits=None):
     phenotype = frame[["FID", "IID", field]].rename(columns={field: "phenotype"}).copy()
+
+    # Recode missing responses and apply the fixed QC ranges.
     values = phenotype["phenotype"].replace({-9: np.nan, 999: np.nan})
+
     if limits is not None:
         values = values.mask((values < limits[0]) | (values > limits[1]))
+
     if field == "WHR":
         values = values.replace({9: np.nan})
+
+    # Screen sex-specific outliers after any log transformation.
     if name.startswith("LOG_"):
         values = np.log(values)
+
     phenotype["phenotype"] = values.mask(detect_outliers(values, stratify=frame["Sex"]))
+
     return phenotype
 
 
@@ -57,15 +65,23 @@ def prepare_phenotypes(metadata_file, genetic_codes_file, biochemistry_file, med
     frame = frame.rename(columns=METADATA_COLUMNS)
     check_unique_ids(frame)
     frame["FID"] = frame["IID"]
+
+    # Reads medication use.
     medication = read_medication_use(medication_file)
+
+    # Phenotype output names.
     names = ["HEIGHT", "LOG_BMI", "DBP", "SBP", "WHR", "FEV1_FVC"] + BINARY_TRAITS + ["CAD"]
     names += list(BLOOD_TRAITS.values()) + [f"{name}_adj" for name in sorted(ADJUSTED)]
+
     output_dir = prepare_output_directory(output_dir)
 
+    # Applies QC and writes the continuous phenotypes.
     for field, limits in CLINICAL_RANGES.items():
         name = "LOG_BMI" if field == "BMI" else field
         phenotype = continuous_phenotype(frame, field, name, limits)
         write_phenotype(phenotype, output_dir, name)
+
+        # Writes the medication-adjusted phenotype.
         if name in ADJUSTED:
             write_phenotype(adjust_for_medication(phenotype, medication, name), output_dir, f"{name}_adj")
 
@@ -75,6 +91,7 @@ def prepare_phenotypes(metadata_file, genetic_codes_file, biochemistry_file, med
     ratio["phenotype"] = prepare_fev1_fvc_ratio(components["FEV1"], components["FVC"], frame["Sex"])
     write_phenotype(ratio, output_dir, "FEV1_FVC")
 
+    # Recode questionnaire responses as cases, controls or missing.
     for name in BINARY_TRAITS:
         phenotype = frame[["FID", "IID", name]].rename(columns={name: "phenotype"}).copy()
         phenotype["phenotype"] = phenotype["phenotype"].replace(BINARY_RECODE)
@@ -86,6 +103,7 @@ def prepare_phenotypes(metadata_file, genetic_codes_file, biochemistry_file, med
     cad["phenotype"] = components.sum(axis=1, min_count=1).clip(lower=0, upper=1)
     write_phenotype(cad, output_dir, "CAD")
 
+    # Link biochemistry records to participant IDs and sex.
     codes = pd.read_csv(genetic_codes_file, dtype={"PROJECT_CODE": str, "file_111": str})
     blood = pd.read_csv(biochemistry_file, dtype={"PROJECT_CODE": str})
     blood = codes.merge(blood, on="PROJECT_CODE").rename(columns={"file_111": "IID"})
@@ -93,11 +111,14 @@ def prepare_phenotypes(metadata_file, genetic_codes_file, biochemistry_file, med
     blood = blood.merge(frame[["IID", "Sex"]], on="IID", validate="many_to_one")
     check_unique_ids(blood)
 
+    # Applies the same outlier and medication rules to blood measurements.
     for field, name in BLOOD_TRAITS.items():
         phenotype = continuous_phenotype(blood, field, name)
         write_phenotype(phenotype, output_dir, name)
+
         if name in ADJUSTED:
             write_phenotype(adjust_for_medication(phenotype, medication, name), output_dir, f"{name}_adj")
+
     print(f"Wrote {len(names)} CARTaGENE phenotype files to {output_dir}")
 
 
@@ -109,6 +130,7 @@ def main():
     parser.add_argument("--medication-file", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    print("Reading CaG phenotypes and medication indicators.", flush=True)
     prepare_phenotypes(args.metadata_file, args.genetic_codes_file, args.biochemistry_file,
                        args.medication_file, args.output_dir)
 

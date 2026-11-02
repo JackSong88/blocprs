@@ -11,5 +11,9 @@ mkdir -p "$ld_dir"
 archive=$(mktemp "${ld_dir}/.EUR.XXXXXX.tar.gz")
 trap 'rm -f -- "$archive"' EXIT
 
-wget --quiet -O "$archive" "https://github.com/shz9/viprs/releases/download/v0.1.2/EUR.tar.gz"
+# Downloads and unpacks the European reference LD matrices.
+printf 'Downloading European reference LD\n'
+wget --progress=dot:giga -O "$archive" "https://github.com/shz9/viprs/releases/download/v0.1.2/EUR.tar.gz"
+printf 'Extracting reference LD to %s\n' "$ld_dir"
 tar -xzf "$archive" -C "$ld_dir" --no-same-owner --no-same-permissions
+printf 'Reference LD ready: %s\n' "$ld_dir"

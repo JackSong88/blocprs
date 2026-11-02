@@ -14,6 +14,8 @@ from utils import check_unique_ids, prepare_output_directory
 
 
 def extract_medication_data(tabular_file, output):
+
+    # Selects baseline medication responses from both sex-specific fields.
     columns = pd.read_csv(tabular_file, nrows=0).columns
     medication_columns = [c for c in columns if "6177-0" in c or "6153-0" in c]
 
@@ -29,6 +31,8 @@ def extract_medication_data(tabular_file, output):
     # Missing or unselected medication responses are not coded as medication use.
     frame["chol_med"] = frame[medication_columns].eq(1).any(axis=1)
     frame["bp_med"] = frame[medication_columns].eq(2).any(axis=1)
+
+    # Saves participant-level medication indicators.
     output = Path(output)
     prepare_output_directory(output.parent)
     frame[["IID", "chol_med", "bp_med"]].to_csv(output, sep="\t", index=False)
@@ -40,6 +44,7 @@ def main():
     parser.add_argument("--tabular-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    print("Reading UKB medication records.", flush=True)
     extract_medication_data(args.tabular_file, args.output)
 
 

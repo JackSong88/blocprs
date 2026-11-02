@@ -19,13 +19,17 @@ import pandas as pd
 def read_header(path):
     open_file = gzip.open if path.suffix == ".gz" else open
     metadata = {}
+
     with open_file(path, "rt") as handle:
         for line in handle:
             line = line.strip()
+
             if not line:
                 continue
+
             if line.startswith("#"):
                 key, separator, value = line.lstrip("#").partition("=")
+
                 if separator and key.strip() in {"genome_build", "HmPOS_build"}:
                     key, value = key.strip(), value.strip()
 
@@ -33,18 +37,23 @@ def read_header(path):
                         raise ValueError(f"{path}: conflicting {key} metadata.")
 
                     metadata[key] = value
+
                 continue
+
             columns = line.split("\t")
 
             if len(columns) != len(set(columns)):
                 raise ValueError(f"{path}: duplicate column names.")
 
             return columns, metadata
+
     raise ValueError(f"{path}: no weight-table header found.")
 
 
 def coordinate_columns(path, genome_build):
     columns, metadata = read_header(path)
+
+    # Prefer Catalog-harmonized coordinates when available.
     harmonized = "hm_pos" in columns or "hm_chr" in columns
     selected = ["hm_chr", "hm_pos"] if harmonized else ["chr_name", "chr_position"]
 
@@ -60,6 +69,7 @@ def coordinate_columns(path, genome_build):
 
 def collect_positions(frame, harmonized, loci, path):
     frame.columns = ["chromosome", "position"]
+
     if harmonized:
 
         # Unplaced harmonized variants and non-autosomal variants are omitted.
@@ -71,6 +81,7 @@ def collect_positions(frame, harmonized, loci, path):
     elif frame.isna().any().any():
         raise ValueError(f"{path}: missing native chromosome or position.")
 
+    # Validates positions before adding them to the extraction set.
     chromosome = frame["chromosome"].str.strip()
     position = pd.to_numeric(frame["position"], errors="coerce")
     valid = position.notna() & position.gt(0) & position.mod(1).eq(0)
@@ -88,10 +99,15 @@ def build_variant_ranges(weights, genome_build, output):
     output = Path(output)
 
     loci = {}
+
     for path in weights:
+        print(f"Reading variant positions: {path.name}", flush=True)
         columns, harmonized = coordinate_columns(path, genome_build)
+
+        # Reads only the coordinate columns, in bounded blocks.
         reader = pd.read_csv(path, sep="\t", comment="#", usecols=columns,
                              dtype=str, chunksize=100000)
+
         with reader:
             for frame in reader:
 
@@ -103,11 +119,14 @@ def build_variant_ranges(weights, genome_build, output):
     if not total:
         raise ValueError("No eligible variant positions were found.")
 
+    # Writes each unique position as a 1-based inclusive PLINK range.
     output.parent.mkdir(parents=True, exist_ok=True)
+
     with output.open("w") as handle:
         for chromosome in sorted(loci, key=lambda c: (not c.isdigit(), int(c) if c.isdigit() else c)):
             for position in sorted(loci[chromosome]):
                 handle.write(f"{chromosome}\t{position}\t{position}\n")
+
     print(f"Wrote {total:,} unique {genome_build} positions to {output}")
 
 
@@ -120,6 +139,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True,
                         help="1-based inclusive PLINK range file.")
     args = parser.parse_args()
+
     try:
         build_variant_ranges(args.weights, args.genome_build, args.output)
     except (OSError, ValueError) as error:

@@ -17,6 +17,7 @@ def prepare_samplesheet(sampleset, prefix_template, genotype_format, chromosomes
         raise ValueError("Each chromosome must appear only once.")
 
     rows = []
+
     for chromosome in chromosomes:
 
         # Absolute paths remain valid when Nextflow runs tasks in working directories.
@@ -24,12 +25,15 @@ def prepare_samplesheet(sampleset, prefix_template, genotype_format, chromosomes
         rows.append({"sampleset": sampleset, "path_prefix": str(prefix),
                      "chrom": chromosome, "format": genotype_format})
 
+    # Saves the chromosome file locations for pgsc_calc.
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+
     with output.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["sampleset", "path_prefix", "chrom", "format"])
         writer.writeheader()
         writer.writerows(rows)
+
     return len(rows)
 
 
@@ -42,9 +46,13 @@ def main():
     parser.add_argument("--chromosomes", nargs="+", type=int, choices=range(1, 23), default=list(range(1, 23)))
     parser.add_argument("--output", type=Path, help="Samplesheet CSV (default: data/{sampleset}/samplesheet.csv).")
     args = parser.parse_args()
+
+    # Uses the standard cohort layout unless paths were supplied.
     cohort_dir = Path("data") / args.sampleset
+
     if args.prefix_template is None:
         args.prefix_template = str(cohort_dir / "genotypes/chr{chrom}")
+
     if args.output is None:
         args.output = cohort_dir / "samplesheet.csv"
 
@@ -53,6 +61,7 @@ def main():
                                     args.chromosomes, args.output)
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"Error: {error}\n")
+
     print(f"Wrote {count} chromosome rows to {args.output}")
 
 

@@ -3,37 +3,52 @@
 import argparse
 from pathlib import Path
 
-from create_datasets import assign_splits, read_metadata, score_participants
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+from dataset_utils import ScoreTable, read_metadata, match_score_participants
 
 
-# Check score coverage before splitting; only participant IDs are read from the scores.
+# Checks that score inputs cover the same eligible participants before splitting.
 def create_splits(scores_files, phenotype_file, covariates_file, ancestry_file, output_dir, family,
-                  num_pcs=10, test_fraction=0.3, seed=7209, stratify=None):
+                  num_pcs=10, test_fraction=0.3, seed=7209):
 
-    if family not in ("gaussian", "binomial") or num_pcs < 0:
-        raise ValueError("Use gaussian/binomial family and a nonnegative number of PCs.")
+    assert family in ("gaussian", "binomial")
+    assert num_pcs >= 0
+    assert scores_files
 
-    if not scores_files:
-        raise ValueError("Supply the score inputs that will share this split.")
-
+    # Establish the same eligible population across all score representations.
     metadata, _ = read_metadata(phenotype_file, covariates_file, ancestry_file, num_pcs, family)
     eligible = None
     missing_scores = 0
-    for path in scores_files:
-        selected, _, missing = score_participants(path, metadata)
 
-        # Sort IDs so input-file order cannot change the random split.
+    for path in scores_files:
+        selected, _, missing = match_score_participants(ScoreTable(path), metadata)
+
+        # Sorts IDs so input-file order cannot change the random split.
         selected = selected.sort_index()
+
         if eligible is None:
             eligible, missing_scores = selected, missing
         elif not selected.index.equals(eligible.index):
             raise ValueError("Score inputs cover different eligible participants; align them before creating splits.")
 
-    split, _ = assign_splits(eligible, family, test_fraction=test_fraction, seed=seed, stratify=stratify)
+    # Preserves case/control proportions for binary phenotypes.
+    labels = eligible["phenotype"] if family == "binomial" else None
+    train_rows, test_rows = train_test_split(np.arange(len(eligible)), test_size=test_fraction,
+                                            stratify=labels, random_state=seed)
+
+    if family == "binomial" and set(eligible.iloc[train_rows]["phenotype"]) != {0, 1}:
+        raise ValueError("Binary training data must contain both cases and controls.")
+
+    # groups training and test participants and labels their split.
+    split = eligible.iloc[np.concatenate([train_rows, test_rows])].copy()
+    split["split"] = ["train"] * len(train_rows) + ["test"] * len(test_rows)
     output_dir = Path(output_dir)
 
-    # Keep existing splits intact; generate new splits in a new directory.
+    # Creates the output directory and fails if it already exists.
     output_dir.mkdir(parents=True, exist_ok=False)
+
     for name in ("train", "test"):
         ids = split.loc[split["split"].eq(name)].reset_index()[["FID", "IID"]]
         ids.to_csv(output_dir / f"{name}_ids.txt", sep="\t", index=False)
@@ -42,7 +57,7 @@ def create_splits(scores_files, phenotype_file, covariates_file, ancestry_file, 
             "splits": split["split"].value_counts().to_dict()}
 
 
-# Save IDs once; pass these files to every subsequent dataset build.
+# Writes separate training and test ID files.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scores-files", nargs="+", required=True,
@@ -54,13 +69,15 @@ def main():
     parser.add_argument("--family", required=True, choices=("gaussian", "binomial"))
     parser.add_argument("--num-pcs", type=int, default=10)
     parser.add_argument("--test-fraction", type=float, default=0.3)
-    parser.add_argument("--stratify", nargs="+", help="Additional strata, e.g. Ancestry Sex; binary case/control status is included automatically.")
     parser.add_argument("--seed", type=int, default=7209)
     args = parser.parse_args()
+    print("Aligning scores, phenotypes and covariates before creating one shared split.", flush=True)
+
     try:
         result = create_splits(**vars(args))
     except (OSError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
+
     print(f"Saved splits for {result['participants']} participants to {args.output_dir}: {result['splits']}.")
     print(f"Otherwise eligible participants without scores: {result['eligible_without_scores']}.")
 

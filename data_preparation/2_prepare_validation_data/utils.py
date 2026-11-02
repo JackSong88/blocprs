@@ -14,10 +14,13 @@ from scipy.stats import zscore
 def detect_outliers(phenotype, sigma_threshold=3, stratify=None, nan_policy="omit"):
     if stratify is None:
         stratify = np.ones_like(phenotype)
+
     mask = np.zeros_like(phenotype, dtype=bool)
+
     for group in np.unique(stratify):
         selected = stratify == group
         mask[selected] = np.abs(zscore(phenotype[selected], nan_policy=nan_policy)) > sigma_threshold
+
     return mask
 
 
@@ -34,12 +37,17 @@ def prepare_fev1_fvc_ratio(fev1, fvc, stratify=None, sigma_threshold=3):
     if strata is not None and len(strata) != len(fev1):
         raise ValueError("Sex strata must match the number of participants.")
 
+    # Log-space QC requires finite, positive lung volumes.
     fev1 = fev1.where(np.isfinite(fev1) & fev1.gt(0))
     fvc = fvc.where(np.isfinite(fvc) & fvc.gt(0))
+
     fev1 = fev1.mask(detect_outliers(np.log(fev1), sigma_threshold, strata))
     fvc = fvc.mask(detect_outliers(np.log(fvc), sigma_threshold, strata))
+
+    # Screen the ratio after screening its two components.
     ratio = fev1 / fvc
     ratio = ratio.where(np.isfinite(ratio) & ratio.gt(0))
+
     return ratio.mask(detect_outliers(np.log(ratio), sigma_threshold, strata)).to_numpy(dtype=float)
 
 
@@ -54,12 +62,16 @@ def read_medication_use(path):
     frame = pd.read_csv(path, sep="\t", dtype={"IID": str, "chol_med": "boolean", "bp_med": "boolean"})
     check_unique_ids(frame)
     frame[["chol_med", "bp_med"]] = frame[["chol_med", "bp_med"]].astype(bool)
+
     return frame
 
 
 # Medication correction follows phenotype QC.
 def adjust_for_medication(frame, medication, phenotype):
+
+    # Matches phenotype and medication records by participant ID.
     merged = frame.merge(medication, on="IID", validate="one_to_one")
+
     if phenotype in {"LDL", "TC"}:
 
         # GLGC corrections: LDL / 0.7 and total cholesterol / 0.8 for users.
@@ -73,7 +85,10 @@ def adjust_for_medication(frame, medication, phenotype):
         use = merged["bp_med"]
     else:
         raise ValueError(f"No medication correction is defined for {phenotype}.")
+
+    # Change values only for participants taking the relevant medication.
     merged["phenotype"] = np.where(use, corrected, merged["phenotype"])
+
     return merged[["FID", "IID", "phenotype"]].copy()
 
 

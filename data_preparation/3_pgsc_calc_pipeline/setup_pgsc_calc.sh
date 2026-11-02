@@ -3,7 +3,16 @@
 # Adapted from MoEPRS: https://github.com/shz9/moe-prs-paper
 # Modified for BLocPRS.
 
+# Downloads the dependencies needed for later pgsc_calc jobs; requires internet access.
+# Requires Java, Apptainer and curl.
+# Downloads Nextflow, pipeline dependencies and reference data for later runs.
+
 set -euo pipefail
+
+module load java
+module load apptainer
+
+###### Step 1: Download and cache directories ######
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 root="$PWD"
@@ -18,7 +27,7 @@ unset NXF_OFFLINE
 mkdir -p "$NXF_HOME/offline_configs" "$NXF_SINGULARITY_CACHEDIR" \
     "$APPTAINER_CACHEDIR" "$root/data/reference"
 
-# Finish downloads before exposing their final filenames.
+# Downloads to a temporary filename so interrupted files are not reused.
 download() {
     local url="$1" output="$2"
 
@@ -28,7 +37,8 @@ download() {
     fi
 }
 
-# Cache the same framework, pipeline and plugins used by the scoring runner.
+###### Step 2: Nextflow and pipeline dependencies ######
+
 download "https://github.com/nextflow-io/nextflow/releases/download/v${NXF_VER}/nextflow" \
     "$NXF_HOME/nextflow"
 chmod +x "$NXF_HOME/nextflow"
@@ -37,12 +47,13 @@ chmod +x "$NXF_HOME/nextflow"
 "$NXF_HOME/nextflow" plugin install nf-schema@2.0.0
 "$NXF_HOME/nextflow" plugin install nf-prov@1.2.2
 
-# The local executor does not need remote institutional profiles.
+# Creates an empty local profile file to avoid fetching institutional settings.
 if [[ ! -f "$NXF_HOME/offline_configs/nfcore_custom.config" ]]; then
     touch "$NXF_HOME/offline_configs/nfcore_custom.config"
 fi
 
-# Containers declared by pgsc_calc v2.1.0.
+###### Step 3: pgsc_calc containers ######
+
 images=(
     pygscatalog:pgscatalog-utils-2.0.0-singularity
     plink2:2.00a5.10-singularity
@@ -55,10 +66,11 @@ images=(
 for image in "${images[@]}"; do
     image="oras://ghcr.io/pgscatalog/$image"
 
-    # Match Nextflow's Singularity cache filenames.
+    # Matches Nextflow's Singularity cache filenames.
     name=${image#*://}
     name=${name//\//-}
     name=${name//:/-}
+
     output="$NXF_SINGULARITY_CACHEDIR/$name.img"
 
     if [[ ! -f "$output" ]]; then
@@ -66,6 +78,8 @@ for image in "${images[@]}"; do
         mv -- "$output.part" "$output"
     fi
 done
+
+###### Step 4: Reference data and liftover chains ######
 
 download https://ftp.ebi.ac.uk/pub/databases/spot/pgs/resources/pgsc_HGDP+1kGP_v1.tar.zst \
     "$root/data/reference/pgsc_HGDP+1kGP_v1.tar.zst"

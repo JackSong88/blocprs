@@ -22,7 +22,7 @@ def validate_ids(ids, label):
         raise ValueError(f"{label} contains duplicate participant IDs.")
 
 
-# Read a headerless withdrawal list; an empty file means no withdrawals.
+# Reads a headerless withdrawal list; an empty file means no withdrawals.
 def read_withdrawals(path):
     try:
         table = pd.read_csv(path, header=None, dtype=str, skip_blank_lines=False)
@@ -33,13 +33,13 @@ def read_withdrawals(path):
         raise ValueError("The withdrawal file must contain one IID column without a header.")
 
     validate_ids(table.iloc[:, 0], "Withdrawal file")
+
     return set(table.iloc[:, 0])
 
 
 def prepare_samples(tabular, withdrawals, keep_out, covariates_out, num_pcs=20):
 
-    if num_pcs < 1:
-        raise ValueError("num_pcs must be at least 1.")
+    assert num_pcs >= 1
 
     tabular, withdrawals, keep_out, covariates_out = [
         Path(path).expanduser() for path in (tabular, withdrawals, keep_out, covariates_out)
@@ -51,11 +51,13 @@ def prepare_samples(tabular, withdrawals, keep_out, covariates_out, num_pcs=20):
     for path in (keep_out, covariates_out):
         path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Reads withdrawals and selects the native UKB QC/covariate fields.
     withdrawn = read_withdrawals(withdrawals)
     pc_columns = [f"PC{i}" for i in range(1, num_pcs + 1)]
     fields = ["eid", "22001-0.0", "21003-0.0", "22019-0.0", "22021-0.0"]
     fields += [f"22009-0.{i}" for i in range(1, num_pcs + 1)]
     names = ["IID", "Sex", "Age", "Aneuploidy", "Relatedness"] + pc_columns
+
     dtypes = {field: float for field in fields[1:]}
     dtypes["eid"] = str
     seen_ids = set()
@@ -65,9 +67,13 @@ def prepare_samples(tabular, withdrawals, keep_out, covariates_out, num_pcs=20):
          TemporaryDirectory(dir=covariates_out.parent, prefix=".covariates_") as covariates_dir:
         keep_temporary = Path(keep_dir) / "keep.tsv"
         covariates_temporary = Path(covariates_dir) / "covariates.tsv"
+
         with keep_temporary.open("w", encoding="utf-8") as keep_handle, \
              covariates_temporary.open("w", encoding="utf-8") as covariates_handle:
+
+            # Reads participant blocks rather than the full UKB table.
             chunks = pd.read_csv(tabular, usecols=fields, dtype=dtypes, chunksize=100000, skip_blank_lines=False)
+
             for chunk in chunks:
                 chunk = chunk[fields]
                 chunk.columns = names
@@ -89,6 +95,7 @@ def prepare_samples(tabular, withdrawals, keep_out, covariates_out, num_pcs=20):
                 # Genotype eligibility does not require complete covariates.
                 samples[["FID", "IID"]].to_csv(keep_handle, sep="\t", header=False, index=False)
                 counts["kept"] += len(samples)
+                print(f"Participant QC: read {counts['read']:,}; retained {counts['kept']:,}.", flush=True)
 
                 # These are native UKB PCs, not the projected reference PCs.
                 covariates = samples[["FID", "IID", "Sex"] + pc_columns + ["Age"]].dropna().copy()
@@ -96,7 +103,7 @@ def prepare_samples(tabular, withdrawals, keep_out, covariates_out, num_pcs=20):
                 covariates.to_csv(covariates_handle, sep="\t", header=False, index=False)
                 counts["covariates"] += len(covariates)
 
-        # Replace outputs only after all input blocks pass QC.
+        # Replaces outputs only after all input blocks pass QC.
         keep_temporary.replace(keep_out)
         covariates_temporary.replace(covariates_out)
 
@@ -111,10 +118,13 @@ def main():
     parser.add_argument("--covariates-out", required=True, help="Headerless FID/IID/Sex/PC1..PCN/Age file.")
     parser.add_argument("--num-pcs", type=int, default=20, help="Number of native UKB PCs to extract (default: 20).")
     args = parser.parse_args()
+    print("Reading UKB records and applying participant QC.", flush=True)
+
     try:
         counts = prepare_samples(args.tabular, args.withdrawals, args.keep_out, args.covariates_out, args.num_pcs)
     except (OSError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
+
     print(f"Samples read: {counts['read']}; kept: {counts['kept']}; complete covariates: {counts['covariates']}.")
 
 

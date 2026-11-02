@@ -1,8 +1,8 @@
-"""Combine real target and out-of-phenotype PRSs on the same participants.
+"""Combine real target and other non-target phenotype control PRSs on the same participants.
 
 The first input defines participant order. Every selected source must cover
 those IDs and the same windows; missing scores are never replaced with zero.
-The output is a raw score directory for create_datasets.py, not a new split.
+# Writes combined PRS scores and labels for subsequent dataset creation. i.e. creat_datasets.py
 """
 
 import argparse
@@ -12,21 +12,14 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import pandas as pd
 
-from create_datasets import feature_layout, participant_index
-from score_io import ScoreTable
+from dataset_utils import ScoreTable, feature_layout, participant_index
 
 
-# Read all ID labels without loading the score matrix.
-def score_ids(table):
-    ids = pd.concat(list(table.iter_ids()), ignore_index=True)
-    participant_index(ids, "Input scores")
-    return ids
-
-
-# Resolve selected sources and require identical window definitions.
+# Selects the requested PRSs, requiring the same windows in every input.
 def panel_layout(inputs, selections):
     plans, output_sources = [], []
     reference_windows = feature_layout(next(iter(inputs.values()))).window.drop_duplicates().tolist()
+
     for specification in selections:
         parts = specification.split(":")
 
@@ -51,12 +44,14 @@ def panel_layout(inputs, selections):
         output_sources.append(alias)
         plans.append((name, selected.column.tolist()))
 
+    # Keeps window-major ordering in the output feature labels.
     rows = [(window, source, source if window == "genomewide" else f"{source}_{window}")
             for window in reference_windows for source in output_sources]
+
     return plans, pd.DataFrame(rows, columns=["window", "source", "column"])
 
 
-# Stream selected score columns into one aligned float32 panel.
+# Streams selected score columns into one aligned float32 panel.
 def build_panel(inputs, selections, output_dir):
     if not inputs or not selections:
         raise ValueError("Provide at least one input and one selected source.")
@@ -66,13 +61,14 @@ def build_panel(inputs, selections, output_dir):
     if output_dir.exists():
         raise FileExistsError(output_dir)
 
-    plans, features = panel_layout(inputs, selections)
     tables = {name: ScoreTable(path) for name, path in inputs.items()}
+    plans, features = panel_layout(tables, selections)
 
-    # Keep the first input's population even when none of its sources are selected.
-    ids = score_ids(next(iter(tables.values())))
+    # Keeps the first input's population even when none of its sources are selected.
+    ids = next(iter(tables.values())).ids
     reference = participant_index(ids, "Reference scores")
     n_windows, n_sources = features.window.nunique(), features.source.nunique()
+
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".control_panel_", dir=output_dir.parent) as temporary:
         directory = Path(temporary) / "scores"
@@ -86,9 +82,9 @@ def build_panel(inputs, selections, output_dir):
                 if not selected:
                     continue
 
-                available = participant_index(score_ids(table), name)
+                print(f"Copying selected control scores from {name}.", flush=True)
 
-                if not reference.isin(available).all():
+                if not reference.isin(participant_index(table.ids, name)).all():
                     raise ValueError(f"Input {name!r} lacks reference participants; align scores before making controls.")
 
                 columns = list(dict.fromkeys(column for _, names in selected for column in names))
@@ -115,19 +111,22 @@ def build_panel(inputs, selections, output_dir):
         finally:
             del scores
 
+        # Saves labels together with the completed score array.
         ids.to_csv(directory / "participants.tsv", sep="\t", index=False)
         features.to_csv(directory / "features.tsv", sep="\t", index=False)
         directory.rename(output_dir)
+
     return len(ids), n_windows, n_sources
 
 
-# Define source panels explicitly; do not select controls using held-out performance.
+# Reads explicit source-panel definitions without selecting controls by held-out performance.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", action="append", required=True, help="NAME=raw_score_path; repeat, reference population first.")
     parser.add_argument("--sources", nargs="+", required=True, help="INPUT:SOURCE[:OUTPUT_NAME] selections.")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    print("Aligning participant IDs and constructing the requested control scores.", flush=True)
     inputs = {}
     for specification in args.input:
         name, separator, path = specification.partition("=")

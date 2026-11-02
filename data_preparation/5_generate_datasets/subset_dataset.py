@@ -7,7 +7,7 @@ from blocprs.selection import filter_participants, id_positions, read_participan
 from blocprs.selection import sample_subsets, stratum_labels
 
 
-# Select a stored population and, optionally, training sample sizes.
+# Defines options for participant filtering and training sample sizes.
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -27,17 +27,21 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-# Keep test membership fixed; omitted training participants never become test rows.
+# Filters within saved splits; omitted training participants never become test rows.
 def main(argv=None):
     args = parse_args(argv)
+    print(f"Reading dataset participants and selecting training subsets: {args.dataset}", flush=True)
 
     if args.sizes and args.split != "train":
         raise ValueError("Sample-size subsets apply to the training split; test/all splits may only be filtered.")
 
+    # Filters within the existing split, without moving participants between splits.
     participants = read_participants(args.dataset, split=args.split)
     if args.ids:
         participants = participants.iloc[id_positions(participants, args.ids)]
     participants = filter_participants(participants, args.ancestry, args.sex, args.filter)
+
+    # Samples the requested subset sizes, or retains all filtered participants.
     if args.sizes:
         labels = stratum_labels(participants, args.stratify, binary_default=not args.no_stratify)
         subsets = sample_subsets(len(participants), args.sizes, labels, args.nested, args.seed)
@@ -45,6 +49,7 @@ def main(argv=None):
     else:
         outputs = {f"{args.split}.ids.tsv": participants}
 
+    # Saves IDs only; the original score arrays stay in place.
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for filename, table in outputs.items():
         path = args.output_dir / filename
