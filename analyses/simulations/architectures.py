@@ -22,7 +22,7 @@ class InfeasibleTruthError(RuntimeError):
     """The sampled architecture cannot attain its declared strength and bounds."""
 
 
-# Reuse independent nuisance columns, or build a rank-aware SVD basis.
+# Nuisance projection reuses independent columns or builds a rank-aware SVD basis.
 def _nuisance_basis(design):
 
     if hasattr(design, "basis"):
@@ -32,16 +32,17 @@ def _nuisance_basis(design):
     matrix = np.column_stack(columns)
     left, singular, _ = np.linalg.svd(matrix, full_matrices=False)
     tolerance = np.finfo(float).eps * max(matrix.shape) * singular[0]
+
     return left[:, singular > tolerance]
 
 
-# Remove covariates and every genome-wide source score before measuring variance.
+# Unique variance excludes covariates and every genome-wide source score.
 def _unique_variance(values, basis):
     residual = values - basis @ (basis.T @ values)
     return float(np.var(residual))
 
 
-# Preserve chromosome quotas while sampling a weighted nonadjacent window set.
+# Weighted nonadjacent window sampling preserves chromosome quotas.
 def _active_windows(chromosomes, strengths, rng, fraction=0.05):
     """Chromosome quotas and a weighted, exact-size nonadjacent selection."""
     labels = np.asarray(chromosomes).astype(str)
@@ -53,22 +54,25 @@ def _active_windows(chromosomes, strengths, rng, fraction=0.05):
     if np.any(strengths < 0.0) or not np.any(strengths > 0.0):
         raise InfeasibleTruthError("No positive residual window-score variance")
 
+    # Chromosome capacities determine quotas for the requested active-window count.
     n_active = min(labels.size, max(2, round(labels.size * fraction)))
     chromosomes, capacities = np.unique(labels, return_counts=True)
     quotas = n_active * capacities / capacities.sum()
     counts = np.floor(quotas).astype(int)
 
-    # Assign leftover windows by fractional quota, with random tie breaks.
+    # Fractional quotas allocate leftover windows, with random tie breaks.
     ties = {chrom: rank for rank, chrom in enumerate(rng.permutation(chromosomes))}
     priority = sorted(
         range(chromosomes.size),
         key=lambda j: (quotas[j] - counts[j], -ties[chromosomes[j]]),
         reverse=True,
     )
+
     for j in priority[: n_active - counts.sum()]:
         counts[j] += 1
 
     selected = []
+
     for chrom, count in zip(chromosomes, counts):
         candidates = np.flatnonzero(labels == chrom)
         n = candidates.size
@@ -83,29 +87,35 @@ def _active_windows(chromosomes, strengths, rng, fraction=0.05):
         utility = np.log(np.maximum(weights, np.finfo(float).tiny))
         utility += rng.gumbel(size=n)
 
-        # Maximize the sampled utilities while keeping exactly count nonadjacent windows.
+        # Dynamic programming maximizes sampled utilities for exactly count nonadjacent windows.
         scores = np.full((n + 1, count + 1), -np.inf)
         take = np.zeros((n + 1, count + 1), dtype=bool)
         scores[:, 0] = 0.0
+
         for used in range(1, n + 1):
             for size in range(1, min(count, (used + 1) // 2) + 1):
                 skip_score = scores[used - 1, size]
                 take_score = scores[max(0, used - 2), size - 1] + utility[used - 1]
                 take[used, size] = take_score > skip_score
                 scores[used, size] = max(skip_score, take_score)
+
+        # Traceback recovers the selected nonadjacent windows from the completed table.
         used, size = n, count
+
         while size:
             if take[used, size]:
                 selected.append(candidates[used - 1])
                 used, size = max(0, used - 2), size - 1
             else:
                 used -= 1
+
     return np.asarray(sorted(selected), dtype=int)
 
 
-# Sample the conditional Dirichlet law without repairing or projecting draws.
+# Conditional Dirichlet sampling does not repair or project draws.
 def _capacity_dirichlet(upper, rng, max_draws=100000):
     """Dirichlet(2) conditional on recipient capacities, without projection."""
+
     if upper.sum() < 1.0 - 1e-12:
         raise InfeasibleTruthError("Recipients cannot absorb the maximum transfer")
 
@@ -121,23 +131,29 @@ def _capacity_dirichlet(upper, rng, max_draws=100000):
         # Two Dirichlet(2) shares reduce to a Beta(2, 2) draw within these bounds.
         cdf = lambda x: 3.0 * x * x - 2.0 * x * x * x
         quantile = cdf(lower) + rng.random() * (cdf(higher) - cdf(lower))
+
         for _ in range(60):
             middle = (lower + higher) / 2.0
+
             if cdf(middle) < quantile:
                 lower = middle
             else:
                 higher = middle
+
         first = (lower + higher) / 2.0
+
         return np.array([first, 1.0 - first])
 
     for _ in range(max_draws):
         weights = rng.dirichlet(np.full(upper.size, 2.0))
+
         if np.all(weights <= upper + 1e-15):
             return weights
+
     raise InfeasibleTruthError("Conditional Dirichlet exceeded 100000 internal draws")
 
 
-# Use the shortest random recipient prefix able to absorb a 95% donor transfer.
+# Redistribution uses the shortest random recipient prefix able to absorb a 95% donor transfer.
 def _redistribution(gamma, identity_rng, allocation_rng):
     donor = int(identity_rng.choice(gamma.size, p=gamma / gamma.sum()))
     remaining = np.delete(np.arange(gamma.size), donor)
@@ -154,10 +170,11 @@ def _redistribution(gamma, identity_rng, allocation_rng):
     allocation = np.zeros(gamma.size)
     allocation[donor] = -1.0
     allocation[order[:count]] = _capacity_dirichlet(capacities[:count], allocation_rng)
+
     return gamma[donor] * allocation
 
 
-# Build independent random streams and literal amplification/attenuation/transfer terms.
+# Perturbation construction uses independent random streams and literal amplification/attenuation/transfer terms.
 def _concentrated_atoms(gamma, n_active, rng):
     """Fixed random blueprint; rows are elementary coefficient perturbations."""
     seeds = rng.integers(0, np.iinfo(np.uint32).max, size=5, dtype=np.uint32)
@@ -173,14 +190,17 @@ def _concentrated_atoms(gamma, n_active, rng):
     patterns = np.repeat(["amplify", "redistribute", "attenuate"], counts)
     pattern_rng.shuffle(patterns)
     magnitudes = 0.25 + 0.50 * magnitude_rng.beta(2.0, 2.0, n_active)
+
     atoms, rates, limits = [], [], []
+
     for window, (pattern, magnitude) in enumerate(zip(patterns, magnitudes)):
 
-        # Draw both allocations so their randomness is independent of mechanism.
+        # Both allocations are drawn independently of the selected mechanism.
         count = int(count_rng.integers(1, min(3, gamma.size) + 1))
         sources = identity_rng.choice(gamma.size, size=count, replace=False)
         shares = allocation_rng.dirichlet(np.full(count, 2.0))
         redistribution = _redistribution(gamma, identity_rng, allocation_rng)
+
         if pattern == "redistribute":
             atom = np.zeros((n_active, gamma.size))
             atom[window] = redistribution
@@ -189,34 +209,37 @@ def _concentrated_atoms(gamma, n_active, rng):
             limits.append(0.95)
         else:
             sign = 1.0 if pattern == "amplify" else -1.0
+
             for source, share in zip(sources, shares):
                 atom = np.zeros((n_active, gamma.size))
                 atom[window, source] = sign * gamma[source]
                 atoms.append(atom)
                 rates.append(magnitude * share)
                 limits.append(np.inf if sign > 0.0 else 0.95)
+
     return np.asarray(atoms), np.asarray(rates), np.asarray(limits)
 
 
-# Measure regional variation not explained by covariates or genome-wide scores.
+# Atomic covariance measures regional variation not explained by covariates or genome-wide scores.
 def _atomic_covariance(scores, atoms, nuisance_basis, block_size=8192):
     """Residualize in two passes without storing N x atomic-term predictors."""
 
-    # Most perturbation coefficients are zero, so use sparse multiplication.
+    # Sparse multiplication exploits the mostly zero perturbation coefficients.
     matrix = csr_matrix(atoms.reshape(atoms.shape[0], -1))
     projected = np.zeros((nuisance_basis.shape[1], atoms.shape[0]))
     n = scores.shape[0]
 
-    # First accumulate the projection onto genome-wide scores and covariates.
+    # The first pass accumulates the projection onto genome-wide scores and covariates.
     # With orthonormal columns Q, Q.T @ X gives the projection coefficients.
     for start in range(0, n, block_size):
         stop = min(start + block_size, n)
         values = (matrix @ scores[start:stop].reshape(stop - start, -1).T).T
         projected += nuisance_basis[start:stop].T @ values
 
-    # Re-read blocks to subtract the projection without storing all participant scores.
+    # A second blockwise pass subtracts the projection without storing all participant scores.
     # This trades a second pass through the scores for lower memory use.
     covariance = np.zeros((atoms.shape[0], atoms.shape[0]))
+
     for start in range(0, n, block_size):
         stop = min(start + block_size, n)
         residual = (matrix @ scores[start:stop].reshape(stop - start, -1).T).T
@@ -227,10 +250,11 @@ def _atomic_covariance(scores, atoms, nuisance_basis, block_size=8192):
     return covariance / n
 
 
-# Ignore a recipient cap that its already-saturated donor can never reach.
+# Recipient caps unreachable after donor saturation do not constrain the multiplier.
 def _lambda_upper(atoms, rates, limits, gamma0):
     """Only caps reached before an atom saturates restrict the common lambda."""
     bounds = []
+
     for atom, rate, limit in zip(atoms, rates, limits):
         positive = atom > 0.0
 
@@ -243,6 +267,7 @@ def _lambda_upper(atoms, rates, limits, gamma0):
         # A recipient safely below its cap after donor saturation adds no bound.
         if not np.isfinite(limit) or allowed_weight < limit - 1e-12:
             bounds.append(allowed_weight / rate)
+
     if bounds:
         return float(min(bounds))
 
@@ -252,7 +277,7 @@ def _lambda_upper(atoms, rates, limits, gamma0):
     raise InfeasibleTruthError("No finite coefficient guardrail for the lambda path")
 
 
-# Use cancellation-resistant quadratic roots, including the linear limit.
+# Root calculation resists cancellation and handles the linear limit.
 def _quadratic_roots(coefficients):
     quadratic, linear, constant = coefficients
     tolerance = 64.0 * np.finfo(float).eps * np.max(np.abs(coefficients))
@@ -264,17 +289,19 @@ def _quadratic_roots(coefficients):
     error = 64.0 * np.finfo(float).eps * (
         linear * linear + abs(4.0 * quadratic * constant)
     )
+
     if discriminant < -error:
         return []
 
     numerator = -0.5 * (linear + np.copysign(np.sqrt(max(discriminant, 0.0)), linear))
+
     if numerator == 0.0:
         return [-linear / (2.0 * quadratic)]
 
     return [numerator / quadratic, constant / numerator]
 
 
-# Search all saturation intervals and retain the first feasible target crossing.
+# The saturation-interval search returns the first feasible target crossing.
 def _smallest_lambda(covariance, genomewide_covariance, gamma0, shifts,
                      rates, limits, upper, target=0.10):
     """Find the first crossing of the piecewise-quadratic variance ratio."""
@@ -284,7 +311,7 @@ def _smallest_lambda(covariance, genomewide_covariance, gamma0, shifts,
     internal = breakpoints[(breakpoints > 0.0) & (breakpoints < upper)]
     boundaries = np.unique(np.concatenate([[0.0, upper], internal]))
 
-    # Evaluate the actual clipped path when validating a candidate root.
+    # Candidate-root validation evaluates the actual clipped path.
     def ratio(strength):
         weights = np.minimum(strength * rates, limits)
         gamma = gamma0 + shifts.T @ weights
@@ -294,6 +321,7 @@ def _smallest_lambda(covariance, genomewide_covariance, gamma0, shifts,
 
     candidates = [point for point in boundaries
                   if np.isclose(ratio(point), target, rtol=1e-9, atol=1e-12)]
+
     for lower, higher in zip(boundaries[:-1], boundaries[1:]):
 
         # Within this interval, weights = intercept + strength * slope.
@@ -313,11 +341,13 @@ def _smallest_lambda(covariance, genomewide_covariance, gamma0, shifts,
             gamma_intercept @ genomewide_covariance @ gamma_intercept,
         ])
 
-        # Solve regional_variance - target * genomewide_variance = 0.
+        # Candidate roots solve regional_variance - target * genomewide_variance = 0.
         for root in _quadratic_roots(numerator - target * denominator):
             tolerance = 1e-10 * max(1.0, abs(lower), abs(higher))
+
             if np.isfinite(root) and lower - tolerance <= root <= higher + tolerance:
                 root = float(np.clip(root, lower, higher))
+
                 if np.isclose(ratio(root), target, rtol=1e-8, atol=1e-12):
                     candidates.append(root)
 
@@ -326,29 +356,33 @@ def _smallest_lambda(covariance, genomewide_covariance, gamma0, shifts,
             f"No lambda reaches regional strength {target:g} within the coefficient bounds"
         )
 
-    # Choose the smallest multiplier reaching the target, not a variance minimum.
+    # The selected multiplier is the smallest target crossing, not a variance minimum.
     return float(min(candidates))
 
 
-# Draw chromosome-wise AR(1) departures; condition only on calibrated positivity.
+# Chromosome-wise AR(1) departures condition only on calibrated positivity.
 def _diffuse(design, gamma, rng, basis):
     chromosomes = np.asarray(design.chromosomes).astype(str)
     target, phi = 0.02, 0.8
     anchor_variance = float(np.var(design.genomewide @ gamma))
+
     for _ in range(100):
         direction = np.zeros((design.n_windows, design.n_sources))
+
         for source in range(design.n_sources):
             for chromosome in sorted(set(chromosomes)):
                 indices = np.flatnonzero(chromosomes == chromosome)
                 innovations = rng.normal(size=indices.size)
                 direction[indices[0], source] = innovations[0]
 
-                # Restart each chromosome; the innovation scale preserves unit AR(1) variance.
+                # The AR(1) process restarts on each chromosome; its innovation scale preserves unit variance.
                 for position in range(1, indices.size):
                     direction[indices[position], source] = (
                         phi * direction[indices[position - 1], source]
                         + np.sqrt(1.0 - phi * phi) * innovations[position]
                     )
+
+        # Regional changes are centered before their unique variance is calibrated.
         direction -= direction.mean(axis=0, keepdims=True)
         direction /= max(float(np.sqrt(np.mean(direction * direction))), 1e-12)
         direction *= gamma
@@ -366,7 +400,7 @@ def _diffuse(design, gamma, rng, basis):
     raise InfeasibleTruthError("No positive A1 architecture after 100 direction draws")
 
 
-# Generate A0/A1/A2 from paired, outcome-independent random streams.
+# A0/A1/A2 generation uses paired, outcome-independent random streams.
 def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
     """Generate primary truth without using outcomes or held-out observations.
 
@@ -374,12 +408,14 @@ def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
     regional(eta), window_strengths(), and active_scores(indices). A cached
     rank-aware orthonormal nuisance basis may be provided as design.basis.
     """
+
     if architecture not in {"A0", "A1", "A2"}:
         raise ValueError("Primary architectures are A0, A1, and A2")
 
     if design.n_sources < 2 or design.n_windows < 2:
         raise ValueError("Simulation requires at least two sources and windows")
 
+    # Replicate-level random streams pair architectures without using outcomes.
     streams = np.random.SeedSequence([seed, panel, replicate]).spawn(4)
     gamma_rng, diffuse_rng, active_rng, concentrated_rng = (
         np.random.default_rng(stream) for stream in streams
@@ -390,6 +426,7 @@ def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
     if not np.isfinite(initial_variance) or initial_variance <= 0.0:
         raise InfeasibleTruthError("The initial genomewide mixture has no variance")
 
+    # Initial genome-wide predictor scaling gives unit training variance.
     gamma0 /= np.sqrt(initial_variance)
     gamma = gamma0.copy()
     eta = np.zeros((design.n_windows, design.n_sources))
@@ -403,12 +440,15 @@ def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
         delta = eta.copy()
         active = np.arange(design.n_windows)
     elif architecture == "A2":
+
+        # Active-window selection precedes calibration of the fixed perturbation pattern.
         active = _active_windows(design.chromosomes, design.window_strengths(), active_rng)
         atoms, rates, limits = _concentrated_atoms(gamma0, active.size, concentrated_rng)
         scores = design.active_scores(active)
         covariance = _atomic_covariance(scores, atoms, basis)
         centered_genomewide = design.genomewide - design.genomewide.mean(axis=0)
         genomewide_covariance = centered_genomewide.T @ centered_genomewide / scores.shape[0]
+
         shifts = atoms.sum(axis=1) / design.n_windows
         upper = _lambda_upper(atoms, rates, limits, gamma0)
         strength = _smallest_lambda(covariance, genomewide_covariance, gamma0,
@@ -416,7 +456,7 @@ def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
         weights = np.minimum(strength * rates, limits)
         delta[active] = np.einsum("m,mwk->wk", weights, atoms)
 
-        # Move the mean perturbation into gamma, preserving gamma + eta = gamma0 + delta.
+        # Mean perturbation shifts into gamma, preserving gamma + eta = gamma0 + delta.
         gamma = gamma0 + delta.mean(axis=0)
         eta = delta - delta.mean(axis=0, keepdims=True)
         effective_ratio = (gamma0 + delta) / gamma0
@@ -424,6 +464,7 @@ def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
         if np.min(effective_ratio) < 0.05 - 1e-10 or np.max(effective_ratio) > 20.0 + 1e-10:
             raise InfeasibleTruthError("Final A2 coefficients violate their declared bounds")
 
+    # Post-calibration checks verify final strength and coefficient identity.
     achieved = 0.0 if architecture == "A0" else _unique_variance(
         design.regional(eta), basis
     ) / float(np.var(design.genomewide @ gamma))

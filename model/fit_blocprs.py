@@ -1,6 +1,7 @@
 """Fit BLocPRS on the training split and save one model archive."""
 
 import argparse
+from time import monotonic
 import logging
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from blocprs import BLocPRS, load_dataset, select_source
 from blocprs.fixed_composition import FixedCompositionBLocPRS
 
 
-# Read the dataset, output path and fitting options.
+# Parses dataset/output paths and fitting options.
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True, help="Packaged dataset directory.")
@@ -35,27 +36,34 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42, help="CV sampling and fold seed (default: 42).")
     parser.add_argument("--block-size", type=int, default=8192,
                         help="Participants processed per design block (default: 8192).")
+
     return parser.parse_args(argv)
 
 
-# Fit only the stored training split, then save all fitted parameters together.
+# Fits only the stored training split, then saves all fitted parameters together.
 def main(argv=None):
+    started = monotonic()
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-    if args.model == "fixed-composition" and args.cv_workers != 1:
-        raise ValueError("Fixed-composition CV currently requires --cv-workers 1.")
+    # Fixed-composition fitting currently supports only the serial path.
+    if args.model == "fixed-composition":
+        assert args.cv_workers == 1
+        assert args.fit_workers == 1 and args.cache_dir is None
 
-    if args.model == "fixed-composition" and (args.fit_workers != 1 or args.cache_dir is not None):
-        raise ValueError("--fit-workers and --cache-dir currently apply to full BLocPRS fitting.")
-
+    # Loads the training participants and optional single-source panel.
+    logging.info("Loading training dataset: %s", args.dataset)
     data = load_dataset(args.dataset, split="train", ids_file=args.train_ids)
+
     if args.source:
         data = select_source(data, args.source)
 
-    if (args.model == "fixed-composition") != (args.genomewide_dataset is not None):
-        raise ValueError("Use --genomewide-dataset with --model fixed-composition only.")
+    logging.info("Training %s: family=%s, N=%s, windows=%s, sources=%s",
+                 args.model, args.family, data.n_samples, len(data.window_names), len(data.source_names))
 
+    assert (args.model == "fixed-composition") == (args.genomewide_dataset is not None)
+
+    # Sets up full BLocPRS or the fixed-composition comparator.
     model_class = FixedCompositionBLocPRS if args.model == "fixed-composition" else BLocPRS
     options = ({"cv_workers": args.cv_workers, "fit_workers": args.fit_workers, "cache_dir": args.cache_dir}
                if args.model == "blocprs" else {})
@@ -67,14 +75,18 @@ def main(argv=None):
 
         # Both stages use the same requested training IDs; the model checks their order and values.
         genomewide = load_dataset(args.genomewide_dataset, split="train", ids_file=args.train_ids)
+
         if args.source:
             genomewide = select_source(genomewide, args.source)
+
         model.fit(data, genomewide)
     else:
         model.fit(data)
 
+    # Saves coefficients and training scaling together.
     args.output.parent.mkdir(parents=True, exist_ok=True)
     model.save(args.output)
+    logging.info("Saved model: %s; elapsed=%.1fs", args.output, monotonic() - started)
     print(f"model={args.model} N={model.n_training_samples_} family={model.family} "
           f"lambda={model.selected_lambda_:g} saved={args.output}")
 

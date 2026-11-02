@@ -8,6 +8,7 @@ metrics as evaluation.
 """
 
 import json
+import logging
 import os
 import tempfile
 import warnings
@@ -26,12 +27,12 @@ from .data import PRSData, select_sources
 from .metrics import IncrementalR2, NagelkerkeR2
 
 
-# Select one named source without choosing it using evaluation outcomes.
+# Selects one named source without choosing it using evaluation outcomes.
 def select_source(data, source):
     return select_sources(data, [source])
 
 
-# Explicitly sum raw window scores when a genome-wide dataset is unavailable.
+# Sums raw window scores explicitly when a genome-wide dataset is unavailable.
 def genomewide_data(data, block_size=8192):
     block_size = _positive_integer(block_size, "block_size")
     scores = np.empty((data.n_samples, 1, data.n_sources), dtype=np.float64)
@@ -52,34 +53,36 @@ class _SourceScaler:
     source_mean: np.ndarray
     source_sd: np.ndarray
 
-    # Compute source scaling only on the supplied fitting participants.
+    # Computes source scaling only on the supplied fitting participants.
     @classmethod
     def fit(cls, sources):
         sd = np.std(sources, axis=0, ddof=0)
         sd[sd == 0] = 1
         return cls(np.mean(sources, axis=0), sd)
 
-    # Apply the saved training means and SDs to new participants.
+    # Applies the saved training means and SDs to new participants.
     def transform(self, sources):
         return (sources - self.source_mean) / self.source_sd
 
 
-# Remove the intercept/covariate component before continuous source fitting (FWL).
+# Removes the intercept/covariate component before continuous source fitting (FWL).
 def _residuals(nuisance, sources, y):
 
-    # Residualize y and every source together. This leaves covariate effects
+    # Residualizes y and every source together. This leaves covariate effects
     # unrestricted while fitting or penalizing only the source coefficients.
     values = np.column_stack((y, sources))
     residual = values - nuisance @ np.linalg.lstsq(nuisance, values, rcond=None)[0]
     return residual[:, 1:], residual[:, 0]
 
 
-# Fit the specified objective, leaving intercept and covariates unpenalized.
+# Fits the specified objective, leaving intercept and covariates unpenalized.
 # Data loss: 0.5 * mean squared error for continuous traits; mean logistic loss for binary traits.
 def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
               initial=None, residuals=None, null_fit=None):
     n, k = sources.shape
     p = nuisance.shape[1]
+
+    # Splits the source penalty into its L1 and L2 parts.
     l1 = lambda_ * ratio
     l2 = lambda_ * (1 - ratio)
 
@@ -88,10 +91,12 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
         iterations = 0
 
         if variant == "nonnegative":
+
+            # Constrains source effects only; covariate coefficients remain unrestricted.
             gamma = nnls(X_res, y_res)[0]
         elif lambda_ == 0:
 
-            # Solve OLS on the covariate-residualized scores and phenotype.
+            # Solves OLS on the covariate-residualized scores and phenotype.
             gamma = np.linalg.lstsq(X_res, y_res, rcond=None)[0]
         elif l1 == 0:
 
@@ -110,15 +115,18 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
             gamma = fitted.coef_
             iterations = int(fitted.n_iter_)
 
-        # Fit intercept and covariates to y minus the fitted genetic score.
+        # Fits intercept and covariates to y minus the fitted genetic score.
         alpha = np.linalg.lstsq(nuisance, y - sources @ gamma, rcond=None)[0]
         coef = np.concatenate((alpha, gamma))
+
+        # Records the data loss and source penalty at the fitted coefficients.
         residual = y - nuisance @ alpha - sources @ gamma
         objective = 0.5 * float(residual @ residual) / n
         objective += l1 * float(np.abs(gamma).sum()) + 0.5 * l2 * float(gamma @ gamma)
+
         return coef, {"objective": objective, "iterations": iterations, "converged": True}
 
-    # At the L1 zero-solution bound, return the fitted null model exactly.
+    # Returns the fitted null model exactly at the L1 zero-solution bound.
     # When the penalty exceeds every source gradient, zero source effects are optimal.
     if l1 > 0:
         null_coef, null_info, max_gradient = (_binomial_null(nuisance, sources, y)
@@ -127,6 +135,7 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
         if lambda_ >= max_gradient / ratio:
             return np.concatenate((null_coef, np.zeros(k))), dict(null_info)
 
+    # Logistic fitting estimates covariate and source coefficients jointly.
     design = np.column_stack((nuisance, sources))
     initial = np.zeros(p + k) if initial is None else np.asarray(initial, dtype=float).copy()
 
@@ -145,6 +154,7 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
             value = np.mean(np.logaddexp(0, linear) - y * linear)
             value += l1 * (positive.sum() + negative.sum()) + 0.5 * l2 * (gamma @ gamma)
             gradient = sources.T @ residual / n + l2 * gamma
+
             return float(value), np.concatenate((nuisance.T @ residual / n, gradient + l1, -gradient + l1))
 
         bounds = [(None, None)] * p + [(0, None)] * (2 * k)
@@ -157,6 +167,7 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
             value = np.mean(np.logaddexp(0, linear) - y * linear) + 0.5 * l2 * (gamma @ gamma)
             gradient = design.T @ (expit(linear) - y) / n
             gradient[p:] += l2 * gamma
+
             return float(value), gradient
 
         bounds = [(None, None)] * p + [(0, None)] * k if variant == "nonnegative" else None
@@ -170,18 +181,20 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
 
     coef = (np.concatenate((result.x[:p], result.x[p:p + k] - result.x[p + k:]))
             if l1 > 0 else result.x)
+
     return coef, {"objective": float(result.fun), "iterations": int(result.nit), "converged": True}
 
 
-# Fit the binary covariate-only optimum and its maximum source gradient.
+# Fits the binary covariate-only model and computes its maximum source gradient.
 def _binomial_null(nuisance, sources, y):
     empty = np.empty((len(y), 0))
     coef, info = _fit_once(nuisance, empty, y, "binomial", "unregularized", 0.0)
     gradient = sources.T @ (expit(nuisance @ coef) - y) / len(y)
+
     return coef, info, float(np.max(np.abs(gradient)))
 
 
-# Find the penalty at which all source coefficients can be zero.
+# Finds the penalty at which all source coefficients can be zero.
 def _lambda_max(nuisance, sources, y, family, ratio, residuals=None, null_fit=None):
     if family == "gaussian":
         X_res, y_res = _residuals(nuisance, sources, y) if residuals is None else residuals
@@ -208,7 +221,7 @@ class MultiPRS:
     ratio 0.5. Unregularized and nonnegative fits have no penalty search.
     """
 
-    # Set the family, comparator variant and CV options.
+    # Sets the family, comparator variant and CV options.
     def __init__(self, family="gaussian", *, variant="unregularized", lambda_=None,
                  lambda_grid=None, l1_ratios=None, cv_folds=5, cv_max_samples=50000,
                  random_state=42, block_size=8192):
@@ -217,7 +230,7 @@ class MultiPRS:
         self.cv_folds, self.cv_max_samples = cv_folds, cv_max_samples
         self.random_state, self.block_size = random_state, block_size
 
-    # Check the score layout and finite inputs without guessing window aggregation.
+    # Checks the score layout and finite inputs without guessing window aggregation.
     def _arrays(self, data, training=False):
         if not isinstance(data, PRSData) or data.n_windows != 1:
             raise ValueError("MultiPRS requires PRSData with one genome-wide score per source.")
@@ -238,25 +251,22 @@ class MultiPRS:
 
         return sources, covariates, y
 
-    # Resolve explicit penalty choices without applying BLocPRS's regional grid.
+    # Resolves explicit penalty choices without applying BLocPRS's regional grid.
     def _choices(self):
-        if self.family not in ("gaussian", "binomial"):
-            raise ValueError("family must be 'gaussian' or 'binomial'.")
-
-        if self.variant not in ("unregularized", "ridge", "lasso", "elasticnet", "nonnegative"):
-            raise ValueError("Unknown MultiPRS variant.")
+        assert self.family in ("gaussian", "binomial")
+        assert self.variant in ("unregularized", "ridge", "lasso", "elasticnet", "nonnegative")
 
         self.block_size = _positive_integer(self.block_size, "block_size")
+
         if self.variant in ("unregularized", "nonnegative"):
-            if self.lambda_ not in (None, 0) or self.lambda_grid is not None or self.l1_ratios is not None:
-                raise ValueError("Unregularized/nonnegative models have no penalty grid or L1 ratio.")
+            assert self.lambda_ in (None, 0) and self.lambda_grid is None and self.l1_ratios is None
 
             return np.array([0.0]), [0.0], False
 
-        if self.lambda_ is not None and self.lambda_grid is not None:
-            raise ValueError("Choose a fixed lambda_ or lambda_grid, not both.")
+        assert self.lambda_ is None or self.lambda_grid is None
 
         search = self.lambda_ is None
+
         if not search:
             candidates = np.array([self.lambda_], dtype=float)
         elif self.lambda_grid is not None:
@@ -271,20 +281,18 @@ class MultiPRS:
         if self.variant == "elasticnet":
             ratios = ([0.1, 0.5, 0.9] if search else [0.5]) if self.l1_ratios is None else list(self.l1_ratios)
         else:
-            if self.l1_ratios is not None:
-                raise ValueError("l1_ratios is only used by elasticnet.")
+            assert self.l1_ratios is None
 
             ratios = [1.0 if self.variant == "lasso" else 0.0]
 
         if not ratios or any(not np.isfinite(r) or r <= 0 or r > 1 for r in ratios if self.variant == "elasticnet"):
             raise ValueError("Elastic-net L1 ratios must lie in (0, 1].")
 
-        if not search and len(ratios) != 1:
-            raise ValueError("A fixed lambda_ requires exactly one elastic-net L1 ratio.")
+        assert search or len(ratios) == 1
 
         return candidates, ratios, search
 
-    # Tune on training folds, then fit every coefficient on all training rows.
+    # Tunes on training folds, then fits every coefficient on all training rows.
     def fit(self, data):
         candidates, ratios, search = self._choices()
         sources, covariates, y = self._arrays(data, training=True)
@@ -295,6 +303,8 @@ class MultiPRS:
         if search:
             selected, ratio, cv_results = self._cross_validate(sources, covariates, y, candidates, ratios)
 
+        # Recomputes source scaling on all training rows for the final fit.
+        logging.getLogger(__name__).info("Baseline full training fit: variant=%s, N=%s", self.variant, len(y))
         scaler = _SourceScaler.fit(sources)
         standardized = scaler.transform(sources)
         residuals = _residuals(nuisance, standardized, y) if self.family == "gaussian" else None
@@ -304,14 +314,14 @@ class MultiPRS:
 
         if search and self.variant in ("lasso", "elasticnet"):
 
-            # CV selects a fraction of the zero-solution bound. Recompute that
-            # bound on all training rows to obtain the final absolute penalty.
+            # CV selects a fraction of the zero-solution bound. The bound is recomputed
+            # on all training rows to obtain the final absolute penalty.
             lambda_ *= _lambda_max(nuisance, standardized, y, self.family, ratio, residuals, null_fit)
 
         coef, fit_info = _fit_once(nuisance, standardized, y, self.family, self.variant,
                                   lambda_, ratio, residuals=residuals, null_fit=null_fit)
 
-        # Replace a previous fitted state only after the new fit succeeds.
+        # Replaces the previous fitted state only after the new fit succeeds.
         self.scaler_, self.coef_, self.fit_info_ = scaler, coef, fit_info
         self.cv_results_ = cv_results
         self.source_names_, self.window_names_ = data.source_names, data.window_names
@@ -319,9 +329,10 @@ class MultiPRS:
         self.selected_candidate_, self.selected_lambda_ = selected, float(lambda_)
         self.selected_l1_ratio_ = ratio
         self.n_training_samples_ = data.n_samples
+
         return self
 
-    # Refit source scaling and the comparator independently within every CV fold.
+    # Refits source scaling and the comparator independently within every CV fold.
     def _cross_validate(self, sources, covariates, y, candidates, ratios):
         folds = _positive_integer(self.cv_folds, "cv_folds", minimum=2)
         cap = len(y) if self.cv_max_samples is None else _positive_integer(self.cv_max_samples, "cv_max_samples", folds)
@@ -332,6 +343,7 @@ class MultiPRS:
 
         sampled = _subsample_indices(y, total, np.random.RandomState(self.random_state),
                                     stratify=self.family == "binomial", min_per_class=folds)
+
         if self.family == "binomial" and np.min(np.unique(y[sampled], return_counts=True)[1]) < folds:
             raise ValueError("Binary CV needs at least cv_folds participants in each class.")
 
@@ -341,23 +353,33 @@ class MultiPRS:
                    for ratio in ratios for value in candidates]
         metric_type = NagelkerkeR2 if self.family == "binomial" else IncrementalR2
 
-        for train, validation in splitter.split(sampled, y[sampled]):
+        logging.getLogger(__name__).info("Baseline CV: N=%s, folds=%s, candidates=%s", total, folds, len(results))
+
+        for fold, (train, validation) in enumerate(splitter.split(sampled, y[sampled]), start=1):
             train, validation = sampled[train], sampled[validation]
+
+            # Freezes this fold's training means and SDs before transforming validation scores.
             scaler = _SourceScaler.fit(sources[train])
             S_train, S_val = scaler.transform(sources[train]), scaler.transform(sources[validation])
+
             nuisance = np.column_stack((np.ones(len(train)), covariates[train]))
             residuals = _residuals(nuisance, S_train, y[train]) if self.family == "gaussian" else None
             null_fit = (_binomial_null(nuisance, S_train, y[train])
                         if self.family == "binomial" and self.variant in ("lasso", "elasticnet") else None)
+
+            # Evaluation calibrates the frozen PRS; it does not refit the source weights.
             metric = metric_type(y[validation], covariates[validation])
             initial, previous_ratio, lambda_max = None, None, 1.0
 
             for entry in results:
                 ratio = entry["l1_ratio"]
+
                 if ratio != previous_ratio:
                     initial = None
+
                     if self.variant in ("lasso", "elasticnet"):
                         lambda_max = _lambda_max(nuisance, S_train, y[train], self.family, ratio, residuals, null_fit)
+
                     previous_ratio = ratio
 
                 lambda_ = entry["candidate"] * lambda_max
@@ -366,33 +388,39 @@ class MultiPRS:
                 entry["fold_scores"].append(float(metric.score(S_val @ coef[nuisance.shape[1]:])))
                 initial = coef
 
+            logging.getLogger(__name__).info("Baseline CV fold %s/%s complete", fold, folds)
+
+        # Selects by the mean score across validation folds.
         for entry in results:
             entry["mean_score"] = float(np.mean(entry["fold_scores"]))
 
         selected = max(results, key=lambda entry: entry["mean_score"])
+        logging.getLogger(__name__).info("Baseline CV selected candidate=%g, L1 ratio=%g, score=%.8g",
+                                         selected["candidate"], selected["l1_ratio"], selected["mean_score"])
+
         return selected["candidate"], selected["l1_ratio"], results
 
-    # Return the fitted intercept.
+    # Returns the fitted intercept.
     @property
     def alpha_0_(self):
         return float(self.coef_[0])
 
-    # Return the coefficients of the raw covariates.
+    # Returns the coefficients of the raw covariates.
     @property
     def alpha_(self):
         return self.coef_[1:1 + len(self.covariate_names_)].copy()
 
-    # Return one coefficient per standardized genome-wide source.
+    # Returns one coefficient per standardized genome-wide source.
     @property
     def gamma_(self):
         return self.coef_[1 + len(self.covariate_names_):].copy()
 
-    # Name the comparator without using its evaluation performance.
+    # Names the comparator without using its evaluation performance.
     @property
     def method_name_(self):
         return "MultiPRS" if self.variant == "unregularized" else f"MultiPRS-{self.variant}"
 
-    # Compute genetic-only scores using saved source scaling and coefficients.
+    # Computes genetic-only scores using saved source scaling and coefficients.
     def predict_prs(self, data):
         sources, _, _ = self._arrays(data)
 
@@ -401,21 +429,20 @@ class MultiPRS:
 
         return self.scaler_.transform(sources) @ self.gamma_
 
-    # Add the fitted raw-covariate contribution and intercept to the genetic score.
+    # Adds the fitted raw-covariate contribution and intercept to the genetic score.
     def predict_linear(self, data):
         if data.covariate_names != self.covariate_names_:
             raise ValueError("Covariate names/order differ from training.")
 
         return self.alpha_0_ + data.covariates @ self.alpha_ + self.predict_prs(data)
 
-    # Convert the fitted full logistic predictor to event probabilities.
+    # Converts the fitted full logistic predictor to event probabilities.
     def predict_proba(self, data):
-        if self.family != "binomial":
-            raise ValueError("predict_proba requires a binomial model.")
+        assert self.family == "binomial"
 
         return expit(self.predict_linear(data))
 
-    # Evaluate the frozen genetic score with the same metric used by BLocPRS.
+    # Evaluates the frozen genetic score with the same metric used by BLocPRS.
     def score(self, data):
         if data.covariate_names != self.covariate_names_:
             raise ValueError("Evaluation covariate names/order differ from training.")
@@ -423,7 +450,7 @@ class MultiPRS:
         metric = NagelkerkeR2 if self.family == "binomial" else IncrementalR2
         return metric(data.y, data.covariates).score(self.predict_prs(data))
 
-    # Save fitted parameters and CV results in one archive, without training data.
+    # Saves fitted parameters and CV results in one archive, without training data.
     def save(self, path):
         path = Path(path)
         metadata = {"format": "blocprs-baseline-v1", "family": self.family, "variant": self.variant,
@@ -439,6 +466,8 @@ class MultiPRS:
                                    "l1_ratios": None if self.l1_ratios is None else list(map(float, self.l1_ratios)),
                                    "cv_folds": self.cv_folds, "cv_max_samples": self.cv_max_samples,
                                    "random_state": self.random_state, "block_size": self.block_size}}
+
+        # Replaces the destination only after the complete archive has been written.
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 
         try:
@@ -446,12 +475,13 @@ class MultiPRS:
                 np.savez_compressed(stream, metadata=np.asarray(json.dumps(metadata, allow_nan=False)),
                                     coef=self.coef_, source_mean=self.scaler_.source_mean,
                                     source_sd=self.scaler_.source_sd)
+
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    # Restore a MultiPRS or single-source fit from a filename or binary stream.
+    # Restores a MultiPRS or single-source fit from a filename or binary stream.
     @classmethod
     def load(cls, path):
         with np.load(path, allow_pickle=False) as saved:
@@ -484,26 +514,27 @@ class MultiPRS:
             model.selected_l1_ratio_ = metadata["selected_l1_ratio"]
             model.cv_results_, model.fit_info_ = metadata["cv_results"], metadata["fit_info"]
             model.n_training_samples_ = metadata["n_training_samples"]
+
         return model
 
 
 class SingleSourcePRS(MultiPRS):
     """Unregularized regression for one prespecified genome-wide PRS."""
 
-    # Record the requested source and use unregularized OLS/logistic fitting.
+    # Records the requested source and uses unregularized OLS/logistic fitting.
     def __init__(self, source, family="gaussian", *, block_size=8192):
         super().__init__(family, block_size=block_size)
         self.source = source
 
-    # Fit only the named source using the shared baseline implementation.
+    # Fits only the named source using the shared baseline implementation.
     def fit(self, data):
         return super().fit(select_source(data, self.source))
 
-    # Extract the same source from a complete source panel during prediction.
+    # Extracts the same source from a complete source panel during prediction.
     def predict_prs(self, data):
         return super().predict_prs(select_source(data, self.source))
 
-    # Identify the supplied source without implying it was selected on test data.
+    # Identifies the supplied source without implying it was selected on test data.
     @property
     def method_name_(self):
         return f"Single-source:{self.source}"

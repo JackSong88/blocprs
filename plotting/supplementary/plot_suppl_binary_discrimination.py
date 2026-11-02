@@ -19,10 +19,13 @@ def load_results(path):
 
 def main():
     args = parse_args(__doc__, supplementary=True, collection="discrimination")
+
+    # Plot inputs include AUROC estimates, DeLong uncertainty and paired tests.
     data, comparisons = load_results(args.results)
+
     with plt.rc_context(style):
         figure = draw_compact_benchmarks(data, comparisons, {"binary": phenotypes["binary"]}, auroc=True)
-        print(save_figure(figure, args.output_dir / "suppl_auroc.pdf"))
+        save_figure(figure, args.output_dir / "suppl_auroc.pdf")
 
 
 if __name__ == "__main__":

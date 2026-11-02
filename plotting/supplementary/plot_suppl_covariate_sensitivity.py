@@ -14,10 +14,11 @@ analyses = core_phenotypes + [(name, "continuous") for name in (
     "LDL_ADJ_MA", "TC_ADJ_MA", "DBP_ADJ_MA", "SBP_ADJ_MA")]
 
 
-# Require both covariate designs for each frozen-model component.
+# Result validation requires both covariate designs for each frozen-model component.
 def load_results(path):
     data = read_results(path)
     records = []
+
     for scenario, cohort in zip(cohorts, ("ukbb", "cartagene")):
         for phenotype, family in analyses:
 
@@ -28,6 +29,7 @@ def load_results(path):
                                    train_group="all", train_size="full", panel="main",
                                    window_mb=1, metric=metric_tokens[family])
             counts = []
+
             for design in designs:
                 for method, mode in (("anchor_only", "anchor_only"), ("blocprs", "full")):
                     row = one_row(frame, covariate_set=design, method=method)
@@ -41,14 +43,17 @@ def load_results(path):
     return pd.DataFrame(records)
 
 
-# Pair the frozen anchor and complete genetic score under each covariate design.
+# Each covariate design pairs the frozen anchor with the complete genetic score.
 def build_pages(data):
     for scenario, cohort in cohorts.items():
         for family in ("continuous", "binary"):
             frame = data.loc[data.Scenario.eq(scenario) & data.family.eq(family)]
             pivot = frame.pivot(index="Phenotype", columns=["NullDesign", "Mode"], values="Value")
+
+            # Connecting lines join anchor-only and full-score estimates within each phenotype.
             fig, axes = plt.subplots(1, 2, figsize=(183 / 25.4, max(80, len(pivot)*9+30) / 25.4))
             fig.subplots_adjust(left=.19, right=.96, bottom=.18, top=.83, wspace=.28)
+
             for ax, design, title in zip(axes, designs, ("Stored covariates", "Expanded covariates")):
                 anchor, full = pivot[(design, "anchor_only")], pivot[(design, "full")]
                 y = np.arange(len(pivot))
@@ -60,6 +65,7 @@ def build_pages(data):
                 style_axis(ax)
                 ax.set_xlabel(metric_labels[family], fontsize=7)
                 ax.set_title(title, fontsize=7)
+
             axes[1].tick_params(labelleft=False)
             fig.suptitle(f"{cohort} - {family}", fontsize=8, y=.96)
             fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncol=2, frameon=False, fontsize=6)
@@ -69,7 +75,9 @@ def build_pages(data):
 # Missing expanded-design analyses stop export; no evaluation is performed here.
 def main():
     args = parse_args(__doc__, supplementary=True, collection="covariate_sensitivity")
+
     data = load_results(args.results)
+
     with plt.rc_context(style):
         save_pages(build_pages(data), args.output_dir / "suppl_covariate_sensitivity.pdf")
 

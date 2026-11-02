@@ -32,8 +32,6 @@ phenotypes = {
 }
 
 
-
-
 # Eligibility uses full-training MultiPRS, not the smaller-sample results.
 def load_inputs(path):
     data = load_training_sizes(path)
@@ -43,6 +41,7 @@ def load_inputs(path):
     data = data.loc[pd.MultiIndex.from_frame(data[["cohort", "phenotype"]]).isin(eligible)].copy()
     data = data.loc[~(data.cohort.eq("cartagene") & data.family.eq("binary") & data.cases.lt(100))]
     data["Cohort"] = data.cohort.map(dict(zip(["ukbb", "cartagene"], cohorts)))
+
     return data.rename(columns={"family": "Family", "phenotype": "Phenotype", "size": "N train",
                                 "model": "Model", "value": "Value"})
 
@@ -50,8 +49,10 @@ def load_inputs(path):
 def relative_change(value, reference):
     value = np.asarray(value, dtype=float)
     reference = np.asarray(reference, dtype=float)
+
     if not np.isfinite(value).all() or not np.isfinite(reference).all() or np.any(reference <= 0):
         raise ValueError("Relative changes require finite values and positive denominators")
+
     return 100.0 * (value / reference - 1.0)
 
 
@@ -69,7 +70,7 @@ def summarize_inputs(data):
         N=("Phenotype", "nunique"),
     ).reset_index()
 
-    # Pair phenotype-panel analyses at each N before taking relative-advantage medians.
+    # Relative-advantage medians use paired phenotype-panel analyses at each N.
     keys = ["Cohort", "Family", "Phenotype", "N train"]
     blocprs = points.loc[points.Model.eq("BLocPRS mb1"), keys + ["Value"]]
     multiprs = points.loc[points.Model.eq("Nonwindowed MultiPRS"), keys + ["Value"]]
@@ -83,6 +84,8 @@ def summarize_inputs(data):
     paired["Win"] = difference.gt(0)
     paired["Loss"] = difference.lt(0)
     paired["Tie"] = difference.eq(0)
+
+    # Training-size summaries aggregate paired gains and win counts.
     keys = ["Cohort", "Family", "N train"]
     advantage = paired.groupby(keys, sort=False).agg(
         Median=("Relative advantage (%)", "median"),
@@ -94,6 +97,7 @@ def summarize_inputs(data):
         Total=("Phenotype", "count"),
     ).reset_index()
     wins["Fraction favoring BLocPRS"] = wins.Wins / wins.Total
+
     return points, growth, paired, advantage, wins
 
 
@@ -102,9 +106,11 @@ def add_win_fraction(axis, x, y, fraction, color):
     # Marker position is median advantage; filled area is wins/total, including ties.
     drawing = DrawingArea(8, 8, 0, 0)
     drawing.add_artist(Circle((4, 4), 2.75, facecolor="#F3F3F3", edgecolor="none"))
+
     if fraction > 0:
         drawing.add_artist(Wedge((4, 4), 2.75, 90 - 360 * fraction, 90,
                                 facecolor=color, edgecolor="none"))
+
     drawing.add_artist(Circle((4, 4), 2.75, facecolor="none", edgecolor="#777777", linewidth=0.3))
     axis.add_artist(AnnotationBbox(drawing, (x, y), frameon=False, xycoords="data",
                                   box_alignment=(0.5, 0.5), pad=0, zorder=6))
@@ -114,6 +120,7 @@ def plot_limits(values):
     values = np.asarray(values, dtype=float)
     low, high = min(0.0, float(values.min())), max(0.0, float(values.max()))
     padding = max(1.0, 0.075 * (high - low))
+
     return low - padding, high + padding
 
 
@@ -126,14 +133,17 @@ def build_figure(growth, paired, advantage, wins):
     x = np.arange(len(sizes))
     offsets = {"continuous": -0.20, "binary": 0.20}
 
-    # Match each column across cohorts, including every displayed boxplot outlier.
+    # Each column shares limits across cohorts, including every displayed boxplot outlier.
     growth_limits = plot_limits(growth.Median)
     advantage_limits = plot_limits(paired["Relative advantage (%)"])
     headers = ["Held-out UK Biobank", r"UK Biobank $\rightarrow$ CARTaGENE transfer"]
+
     for row, cohort in enumerate(cohorts):
         left, right = [fig.add_subplot(grid[row, column]) for column in range(2)]
+
         for family in families:
             color = family_colors[family]
+
             for model in models:
                 baseline = model == "Nonwindowed MultiPRS"
                 values = growth.loc[
@@ -144,6 +154,7 @@ def build_figure(growth, paired, advantage, wins):
                           marker="o" if baseline else "s", markersize=2.8,
                           markerfacecolor="white" if baseline else color,
                           markeredgewidth=0.55, zorder=4)
+
             cell = paired.loc[paired.Cohort.eq(cohort) & paired.Family.eq(family)]
 
             # These boxes summarize variation across phenotypes, not uncertainty within a phenotype.
@@ -167,9 +178,11 @@ def build_figure(growth, paired, advantage, wins):
             counts = wins.loc[
                 wins.Cohort.eq(cohort) & wins.Family.eq(family)
             ].set_index("N train").reindex(sizes)
+
             for position, median, fraction in zip(
                     positions, values.Median, counts["Fraction favoring BLocPRS"]):
                 add_win_fraction(right, position, median, fraction, color)
+
         for column, axis in enumerate([left, right]):
             axis.axhline(0, color="#4A4A4A", linewidth=0.55, linestyle=(0, (1, 1.5)), zorder=0)
             style_axis(axis)
@@ -185,9 +198,12 @@ def build_figure(growth, paired, advantage, wins):
             axis.set_ylabel(r"$R^2_N/R^2_{N=2{,}500}-1$ (%)" if column == 0
                             else r"$R^2_{\mathrm{BLocPRS}}/R^2_{\mathrm{MultiPRS}}-1$ (%)",
                             fontsize=7, labelpad=1.0)
+
         bounds = grid[row, :].get_position(fig)
         fig.text(center_x, bounds.y1 + 0.060, headers[row], fontsize=7, ha="center",
                  va="center", math_fontfamily="dejavusans")
+
+    # Separate legends identify family colors, model lines and the win-fraction marker.
     family_handles = [Line2D([0], [0], color=family_colors[family], linewidth=1.3,
                              label=family.capitalize()) for family in families]
     fig.legend(handles=family_handles, loc="center", bbox_to_anchor=(center_x, 0.941),
@@ -209,12 +225,16 @@ def build_figure(growth, paired, advantage, wins):
                bbox_to_anchor=((right_bounds.x0 + right_bounds.x1) / 2, 0.921),
                frameon=False, fontsize=6.5, handlelength=1.1, handletextpad=0.5)
     fig.supxlabel("Training sample size (N)", x=center_x, y=0.012, fontsize=7)
+
     return fig
 
 
 def main():
     args = parse_args(__doc__, collection="sample_size")
+
+    # Training-size summaries pair models at each sample size.
     _, growth, paired, advantage, wins = summarize_inputs(load_inputs(args.results))
+
     with plt.rc_context(style):
         figure = build_figure(growth, paired, advantage, wins)
         save_figure(figure, args.output_dir / "Figure_3.pdf")

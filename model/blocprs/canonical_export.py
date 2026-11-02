@@ -7,6 +7,7 @@ autosomal diploid scoring.
 """
 
 import csv
+import logging
 import gzip
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import pandas as pd
 from .export import _model_arrays, _numeric_column, export_snp_weights
 
 
-# Keep integer chromosome/position labels exact and restrict dosage reversal to autosomes.
+# Preserves exact integer chromosome/position labels and restricts dosage reversal to autosomes.
 def _coordinates(frame):
     chromosome = frame["chromosome"].astype(str).str.replace(r"^chr", "", regex=True)
     positions = _numeric_column(frame, "position")
@@ -31,13 +32,16 @@ def _coordinates(frame):
     frame["position"] = positions.astype(np.int64)
 
 
-# Read only fitted sources from the final, window-assigned crosswalk files.
+# Reads only fitted sources from the final, window-assigned crosswalk files.
 def _read_cross_mapping(paths, sources, windows, cohort):
     columns = ["accession", "source_key", "effect_weight", "window_id_global",
                f"{cohort}_id", f"{cohort}_effect_allele", f"{cohort}_chr", f"{cohort}_position"]
     selected = []
+
     for path in paths:
+        logging.getLogger(__name__).info("Reading assigned SNP weights: %s", path)
         opener = gzip.open if path.suffix == ".gz" else open
+
         with opener(path, "rt", newline="") as handle:
             header = next(csv.reader(handle, delimiter="\t"))
 
@@ -47,8 +51,11 @@ def _read_cross_mapping(paths, sources, windows, cohort):
         with pd.read_csv(path, sep="\t", usecols=columns, dtype=str,
                          keep_default_na=False, chunksize=100000) as reader:
             for frame in reader:
+
+                # Removes build suffixes before selecting the fitted sources.
                 frame["accession"] = frame["accession"].str.replace(r"_hmPOS_GRCh(?:37|38)$", "", regex=True)
                 frame = frame.loc[frame["accession"].isin(sources)].copy()
+
                 if frame.empty:
                     continue
 
@@ -60,6 +67,7 @@ def _read_cross_mapping(paths, sources, windows, cohort):
                 if np.any((ids < 0) | (ids != np.floor(ids)) | (ids >= 2**53)):
                     raise ValueError("The crosswalk needs nonnegative, integer window_id_global assignments.")
 
+                # Uses the saved window IDs, not the crosswalk's row order.
                 frame["window"] = [f"w{int(value):04d}" for value in ids]
 
                 if not set(frame["window"]).issubset(windows):
@@ -86,7 +94,7 @@ def _read_cross_mapping(paths, sources, windows, cohort):
     return mapping.drop(columns="source_key")
 
 
-# Reconstruct the exact CHR:POS:REF:ALT IDs used by the canonical PLINK scoring script.
+# Reconstructs the exact CHR:POS:REF:ALT IDs used by the canonical PLINK scoring script.
 def _read_pvar(path, requested, max_allele_length):
     columns = ["chromosome", "position", "raw_id", "ref", "alt"]
     wanted_ids = set(requested["variant_id"])
@@ -99,6 +107,7 @@ def _read_pvar(path, requested, max_allele_length):
         for frame in reader:
             _coordinates(frame)
             frame = frame.loc[frame["position"].isin(wanted_positions)].copy()
+
             if frame.empty:
                 continue
 
@@ -108,6 +117,7 @@ def _read_pvar(path, requested, max_allele_length):
             frame["variant_id"] = (frame["chromosome"] + ":" + frame["position"].astype(str)
                                    + ":" + frame["ref"] + ":" + frame["alt"])
             frame = frame.loc[frame["variant_id"].isin(wanted_ids)].copy()
+
             if not frame.empty:
                 selected.append(frame.drop(columns=["raw_id", "chromosome", "position"]))
 
@@ -128,7 +138,7 @@ def _read_pvar(path, requested, max_allele_length):
     return alleles
 
 
-# Normalize to cohort ALT dosage, retaining the diploid constant when REF was scored.
+# Normalizes to cohort ALT dosage, retaining the diploid constant when REF was scored.
 def export_canonical_snp_weights(model, cross_mapping, *, cohort, genome_build, pvar_template=None, path=None):
     """Use assigned crosswalk weights and cohort PVAR alleles; no new matching or liftover.
 
@@ -145,6 +155,7 @@ def export_canonical_snp_weights(model, cross_mapping, *, cohort, genome_build, 
     if not paths or len({item.resolve() for item in paths}) != len(paths):
         raise ValueError("Supply each final assigned crosswalk file exactly once.")
 
+    # Keeps only the fitted sources, with their existing variant-to-window assignments.
     sources, windows, *_ = _model_arrays(model)
     mapping = _read_cross_mapping(paths, sources, windows, cohort)
     template = str(pvar_template or f"data/{cohort}/genotypes/chr{{chr}}.pvar")
@@ -154,9 +165,11 @@ def export_canonical_snp_weights(model, cross_mapping, *, cohort, genome_build, 
 
     oriented = []
 
-    # Match the ID-length limits in score_canonical_transfer_windows.sh.
+    # Matches the ID-length limits in score_canonical_transfer_windows.sh.
     max_allele_length = 100 if cohort == "ukbb" else 1000
+
     for chromosome, frame in mapping.groupby("chromosome", sort=False):
+        logging.getLogger(__name__).info("Aligning exported SNP alleles: chr%s", chromosome)
         alleles = _read_pvar(Path(template.format(chr=chromosome)), frame, max_allele_length)
         frame = frame.merge(alleles, on="variant_id", how="left", validate="many_to_one", sort=False)
         reversed_allele = frame["matched_allele"].eq(frame["ref"])
@@ -165,7 +178,7 @@ def export_canonical_snp_weights(model, cross_mapping, *, cohort, genome_build, 
             raise ValueError("A matched effect allele is neither REF nor ALT in the cohort PVAR.")
 
         # beta * dosage(REF) = 2 * beta - beta * dosage(ALT).
-        # Keep the constant as well as flipping the weight, so exported scores retain their level.
+        # The offset preserves the score level when REF dosage is rewritten as ALT dosage.
         frame["allele_offset"] = np.where(reversed_allele, 2 * frame["weight"], 0.0)
         frame["weight"] = np.where(reversed_allele, -frame["weight"], frame["weight"])
         frame["effect_allele"], frame["other_allele"] = frame["alt"], frame["ref"]

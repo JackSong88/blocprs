@@ -20,7 +20,7 @@ from .data import PRSData, _ScoreView
 logger = logging.getLogger(__name__)
 
 
-# Check available temporary space before starting a collection of caches.
+# Checks free disk space before creating temporary caches.
 @contextmanager
 def workspace(cache_dir=None, required_bytes=0):
     root = Path(cache_dir or os.environ.get("SLURM_TMPDIR") or tempfile.gettempdir())
@@ -35,7 +35,7 @@ def workspace(cache_dir=None, required_bytes=0):
         yield Path(directory)
 
 
-# Copy only the sampled raw CV scores, preserving their values and row order.
+# Copies only the sampled raw CV scores, preserving their values and row order.
 @contextmanager
 def stage_cv_data(data, rows, directory, block_size):
     started = perf_counter()
@@ -45,7 +45,7 @@ def stage_cv_data(data, rows, directory, block_size):
     logger.info("CV input cache: %s participants", len(rows))
 
     try:
-        # Resolve physical rows before scheduling reads; a source view may reorder both axes.
+        # Maps selected rows and sources back to the underlying score array.
         source, source_rows, columns = data.window_scores, np.asarray(rows), None
 
         if isinstance(source, _ScoreView):
@@ -58,8 +58,7 @@ def stage_cv_data(data, rows, directory, block_size):
         last = int(sorted_rows[-1]) + 1
         completed, next_report = 0, 25
 
-        # Stage-5 score arrays are row-major. Copy contiguous blocks before selecting rows
-        # so shared-storage reads stay sequential rather than following random CV indices.
+        # Reads contiguous blocks from storage, then selects sampled rows in memory.
         for start in range(first, last, block_size):
             stop = min(start + block_size, source.shape[0])
             left, right = np.searchsorted(sorted_rows, (start, stop))
@@ -73,7 +72,7 @@ def stage_cv_data(data, rows, directory, block_size):
             if columns is not None:
                 selected = selected[:, :, columns]
 
-            # Scatter locally into the original sampled order; folds and scaling are unchanged.
+            # Restores the original CV sample order.
             scores[read_order[left:right]] = selected
             completed += right - left
             del block, selected
@@ -99,33 +98,33 @@ def stage_cv_data(data, rows, directory, block_size):
 class CachedDesign:
     """Read an already transformed design without repeating standardization."""
 
-    # Keep the same layout and participant blocks as the original design.
+    # Keeps the same layout and participant blocks as the original design.
     def __init__(self, X, y, design):
         self.X, self.y = X, y
         self.n_samples, self.n_features = X.shape
         self.n_covariates = design.n_covariates
         self.block_size = design.block_size
 
-    # Read a contiguous block; concurrent workers never modify these arrays.
+    # Reads a contiguous block; concurrent workers never modify these arrays.
     def read_block(self, start, stop):
         return self.X[start:stop], self.y[start:stop]
 
-    # Iterate in the original row order to retain the same reduction order.
+    # Reads blocks in the original row order to preserve the summation order.
     def iter_blocks(self, *, include_outcome=True):
         for start in range(0, self.n_samples, self.block_size):
             stop = min(start + self.block_size, self.n_samples)
             yield self.X[start:stop], self.y[start:stop] if include_outcome else None
 
-    # Outcomes are already transformed using the associated training scaler.
+    # Returns outcomes transformed with the associated training scaler.
     def outcome(self):
         return self.y
 
-    # Exclude the intercept and genetic columns from evaluation covariates.
+    # Returns evaluation covariates without the intercept or genetic columns.
     def covariates(self):
         return self.X[:, 1:1 + self.n_covariates]
 
 
-# Cache a transformed design once; retain float64 arithmetic and remove it on exit.
+# Caches a transformed design as float64 and removes it on exit.
 @contextmanager
 def cached_design(design, directory, name):
     started = perf_counter()
@@ -140,6 +139,7 @@ def cached_design(design, directory, name):
         y = np.lib.format.open_memmap(folder / "y.npy", mode="w+", dtype=np.float64,
                                       shape=(design.n_samples,))
         offset = 0
+
         for values, outcome in design.iter_blocks():
             stop = offset + len(values)
 
@@ -153,7 +153,7 @@ def cached_design(design, directory, name):
         if offset != design.n_samples:
             raise ValueError("The design cache has incomplete participant rows.")
 
-        # Do not retain the last full design block while the cached fit runs.
+        # Releases the last full design block before fitting the cached design.
         del values, outcome
         X.flush()
         y.flush()
@@ -167,4 +167,5 @@ def cached_design(design, directory, name):
         for array in (X, y):
             if array is not None:
                 array._mmap.close()
+
         shutil.rmtree(folder)

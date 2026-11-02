@@ -16,7 +16,7 @@ __all__ = ["BLocPRS", "MultiPRS", "SingleSourcePRS", "FixedCompositionBLocPRS",
            "export_snp_weights", "export_canonical_snp_weights", "regional_coefficients"]
 
 
-# Load the model class recorded in a package archive; never load Python pickles.
+# Loads the model class recorded in a package archive without loading Python pickles.
 def load_model(path):
     with np.load(path, allow_pickle=False) as saved:
         format_name = json.loads(str(saved["metadata"].item()))["format"]

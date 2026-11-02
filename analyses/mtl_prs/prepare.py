@@ -11,9 +11,11 @@ from blocprs.cv import _subsample_indices
 from .genotypes import PgenDosages
 
 
-# Load training scores and reserve validation participants without changing the outer split.
+# Data preparation loads training scores and reserves validation participants without changing the outer split.
 def prepare_data(dataset, family, validation_size=50000, seed=42, validation_ids=None):
     dataset = Path(dataset)
+
+    # Preparation loads training scores and the stored outer test IDs.
     train = load_dataset(dataset, split="train")
     participants = pd.read_csv(dataset / "participants.tsv", sep="\t", dtype={"FID": str, "IID": str})
     test_ids = participants.loc[participants.split.eq("test"), ["FID", "IID"]].to_numpy(dtype=str)
@@ -21,8 +23,9 @@ def prepare_data(dataset, family, validation_size=50000, seed=42, validation_ids
     if not len(test_ids):
         raise ValueError("MTL-PRS requires a stored outer test split.")
 
-    # Sum windows in bounded blocks; genome-wide datasets have one window.
+    # Bounded participant blocks sum window scores; genome-wide datasets have one window.
     scores = np.empty((train.n_samples, train.n_sources), dtype=np.float64)
+
     for start in range(0, train.n_samples, 4096):
         stop = min(start + 4096, train.n_samples)
         scores[start:stop] = np.sum(train.window_scores[start:stop], axis=1, dtype=np.float64)
@@ -41,6 +44,7 @@ def prepare_data(dataset, family, validation_size=50000, seed=42, validation_ids
         if not 0 < validation_size < len(y):
             raise ValueError("Validation size must leave participants for both fitting and selection.")
 
+        # Stratified sampling preserves case/control balance in binary validation rows.
         validation_rows = _subsample_indices(y, validation_size, np.random.RandomState(seed),
                                              stratify=family == "binomial", min_per_class=5)
     else:
@@ -49,15 +53,17 @@ def prepare_data(dataset, family, validation_size=50000, seed=42, validation_ids
         if requested.isna().any().any() or requested.duplicated().any():
             raise ValueError("Validation IDs must be complete and unique.")
 
+        # Supplied validation IDs resolve against the training split only.
         available = pd.MultiIndex.from_arrays(train.sample_ids.T)
         validation_rows = available.get_indexer(pd.MultiIndex.from_frame(requested))
 
         if np.any(validation_rows < 0) or not 0 < len(validation_rows) < len(y):
             raise ValueError("Validation IDs must be a nonempty proper subset of outer training.")
 
-    # Preserve dataset row order for both inner partitions.
+    # Both inner partitions retain dataset row order.
     validation = np.zeros(len(y), dtype=bool)
     validation[validation_rows] = True
+
     return {"fid": train.sample_ids[:, 0].astype(str), "iid": train.sample_ids[:, 1].astype(str),
             "test_fid": test_ids[:, 0], "test_iid": test_ids[:, 1], "y": y,
             "covariates": covariates, "scores": scores,
@@ -66,9 +72,10 @@ def prepare_data(dataset, family, validation_size=50000, seed=42, validation_ids
             "family": np.asarray(family), "seed": np.asarray(seed), "dataset": np.asarray(str(dataset.resolve()))}
 
 
-# Match accession columns while allowing a source to be absent from one additive shard.
+# Accession matching allows a source to be absent from one additive shard.
 def source_columns(header, sources):
     columns = {}
+
     for source in sources:
         matches = [name for name in (source, f"{source}_hmPOS_GRCh37", f"{source}_hmPOS_GRCh38") if name in header]
 
@@ -77,10 +84,11 @@ def source_columns(header, sources):
 
         if matches:
             columns[source] = matches[0]
+
     return columns
 
 
-# Combine canonical additive shards, then express all effects on the PGEN ALT allele.
+# Weight preparation combines canonical additive shards and expresses all effects on the PGEN ALT allele.
 def prepare_weights(chromosome, genotype_prefix, scorefile_template, sources, pi, output):
     if np.asarray(pi).shape != (len(sources),) or not np.isfinite(pi).all():
         raise ValueError("Each source needs one finite mixture coefficient.")
@@ -92,14 +100,18 @@ def prepare_weights(chromosome, genotype_prefix, scorefile_template, sources, pi
     if not paths:
         raise FileNotFoundError(f"No canonical scorefiles for chromosome {chromosome}.")
 
+    # Selected source-mixture coefficients combine the raw SNP effects.
     frames, found = [], set()
+
     for path in paths:
         header = pd.read_csv(path, sep="\t", nrows=0).columns
         columns = source_columns(header, sources)
         found.update(columns)
         usecols = ["ID", "effect_allele", *columns.values()]
+
         for chunk in pd.read_csv(path, sep="\t", usecols=usecols, dtype={"ID": str, "effect_allele": str}, chunksize=100000):
             beta = np.zeros(len(chunk), dtype=np.float64)
+
             for source, coefficient in zip(sources, pi):
                 if source not in columns:
                     continue
@@ -125,8 +137,10 @@ def prepare_weights(chromosome, genotype_prefix, scorefile_template, sources, pi
     if weights[["snp", "effect_allele"]].isna().any().any():
         raise ValueError("Nonzero source weights require SNP IDs and effect alleles.")
 
+    # Repeated variant/allele rows sum before alignment to the genotype file.
     weights = weights.groupby(["snp", "effect_allele"], as_index=False, sort=False).beta.sum()
     weights = weights.loc[weights.beta.ne(0)]
+
     with PgenDosages(genotype_prefix) as genotypes:
         variants = genotypes.variants
         aligned = weights.merge(variants, on="snp", how="left", validate="many_to_one", indicator=True)
@@ -135,9 +149,8 @@ def prepare_weights(chromosome, genotype_prefix, scorefile_template, sources, pi
         raise ValueError("Canonical nonzero SNP weights are missing from the target genotype file.")
 
     same = aligned.effect_allele.eq(aligned.alt)
-    opposite = aligned.effect_allele.eq(aligned.ref)
 
-    if not (same | opposite).all():
+    if not (same | aligned.effect_allele.eq(aligned.ref)).all():
         raise ValueError("Canonical SNP effect alleles do not match the target REF/ALT alleles.")
 
     # REF-coded effects become negative ALT effects; the resulting constant is absorbed by the intercept.
@@ -147,7 +160,10 @@ def prepare_weights(chromosome, genotype_prefix, scorefile_template, sources, pi
 
     # Only nonzero allele-oriented mixtures enter M and the update paths.
     weights = weights.loc[weights.beta.ne(0)].sort_values("variant_index")
+
+    # The chromosome mixture is saved in genotype order.
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     weights.to_csv(output, sep="\t", index=False, compression="infer")
+
     return len(weights)

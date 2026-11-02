@@ -15,9 +15,9 @@ variant weights for conventional PRS scoring.
 
 1. `data_preparation/1_prepare_pgs_weights/`: download and prepare source PRS weights.
 2. `data_preparation/2_prepare_validation_data/`: prepare cohort genotypes, phenotypes and covariates.
-3. `data_preparation/3_pgsc_calc_pipeline/`: run pgsc_calc and extract genome-wide scores, ancestry assignments and projected PCs.
-4. `data_preparation/4_prepare_window_scores/`: harmonize variants across cohorts, assign genomic windows, score and construct window-specific PRSs.
-5. `data_preparation/5_generate_datasets/`: use `create_splits.py` once (or reuse existing IDs), then build genome-wide and windowed datasets with those same IDs using `create_datasets.py`. Transfer datasets use `--all-participants`; helpers create training subsets and structured source controls.
+3. `data_preparation/3_pgsc_calc_pipeline/`: run pgsc_calc for variant matching, ancestry assignments and projected PCs; retain its matching and allele-frequency outputs for canonical scoring.
+4. `data_preparation/4_prepare_window_scores/`: harmonize variants across cohorts, assign genomic windows, and independently score both genome-wide and window-specific PRSs using the same canonical variants and weights. These matched outputs, rather than ordinary pgsc_calc genome-wide scores, feed the model comparisons.
+5. `data_preparation/5_generate_datasets/`: use `create_splits.py` once (or reuse existing IDs), then build genome-wide and windowed datasets with those same IDs using `create_datasets.py`. Transfer datasets use `--all-participants`; helpers create training subsets and structured source controls. The optional `check_window_sums.py` compares completed datasets without rereading raw scoring files.
 6. `model/`: fit BLocPRS and comparator models, save fitted parameters and export SNP weights. The reusable model implementation is in `model/blocprs/`.
 7. `evaluation/`: evaluate prediction performance, paired bootstrap uncertainty and AUROC comparisons.
 8. `analyses/`: run the supporting analyses:

@@ -1,13 +1,15 @@
 """Fit a genome-wide single-source or MultiPRS comparator on the training split."""
 
 import argparse
+import logging
+from time import monotonic
 from pathlib import Path
 
 from blocprs import load_dataset
 from blocprs.baseline_model import MultiPRS, SingleSourcePRS
 
 
-# Read the dataset, comparator and compact set of fitting options.
+# Parses dataset paths, comparator choices and fitting options.
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True, help="Packaged genome-wide dataset directory.")
@@ -22,17 +24,24 @@ def parse_args(argv=None):
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--cv-max-samples", type=int, default=50000, help="Total participants available to CV, not per fold.")
     parser.add_argument("--seed", type=int, default=42)
+
     return parser.parse_args(argv)
 
 
-# Fit the stored training split and save the coefficients and source scaling.
+# Fits the stored training split and saves the coefficients and source scaling.
 def main(argv=None):
+    started = monotonic()
     args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+
+    # Uses only the stored training split or the requested subset of it.
+    logging.info("Loading training dataset: %s", args.dataset)
     data = load_dataset(args.dataset, split="train", ids_file=args.train_ids)
+    logging.info("Fitting %s: family=%s, N=%s, sources=%s",
+                 args.source or args.variant, args.family, data.n_samples, len(data.source_names))
 
     if args.source:
-        if args.variant != "unregularized" or args.lambda_ is not None or args.l1_ratio is not None:
-            raise ValueError("--source uses unregularized fitting; do not supply MultiPRS penalty options.")
+        assert args.variant == "unregularized" and args.lambda_ is None and args.l1_ratio is None
 
         model = SingleSourcePRS(args.source, args.family)
     else:
@@ -41,9 +50,12 @@ def main(argv=None):
                          cv_folds=args.cv_folds, cv_max_samples=args.cv_max_samples,
                          random_state=args.seed)
 
+    # Fits the comparator, then saves its coefficients and source scaling.
     model.fit(data)
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     model.save(args.output)
+    logging.info("Saved model: %s; elapsed=%.1fs", args.output, monotonic() - started)
     print(f"N={model.n_training_samples_} method={model.method_name_} "
           f"lambda={model.selected_lambda_:g} saved={args.output}")
 

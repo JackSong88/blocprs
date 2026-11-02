@@ -51,6 +51,7 @@ def parse_args(description, supplementary=False, interpretation=False, collectio
                             help="Raw GWAS path containing {phenotype}, {chromosome}, {group} and optionally {suffix}.")
 
     args = parser.parse_args()
+    print(f"Preparing figure: {description}", flush=True)
 
     if not interpretation:
         args.results = args.results or args.data_root / "evaluation" / collection
@@ -65,7 +66,7 @@ def parse_args(description, supplementary=False, interpretation=False, collectio
     return args
 
 
-# Attach one bootstrap table to matching point estimates; conflicting runs must remain separate.
+# Uncertainty merging attaches one bootstrap table to matching point estimates and rejects conflicting runs.
 def merge_uncertainty_rows(data):
     duplicated = data.duplicated(result_keys, keep=False)
 
@@ -73,6 +74,7 @@ def merge_uncertainty_rows(data):
         return data
 
     combined = [data.loc[~duplicated]]
+
     for key, rows in data.loc[duplicated].groupby(result_keys, dropna=False, sort=False):
         bootstrapped = rows.get("n_boot", pd.Series(0, index=rows.index)).fillna(0).gt(0)
 
@@ -84,28 +86,27 @@ def merge_uncertainty_rows(data):
         if uncertainty.get("uncertainty_method") != "paired_bootstrap":
             raise ValueError(f"Unrecognized uncertainty table for {key}.")
 
-        # Only serialization-level rounding is allowed, not a changed prediction or cohort.
+        # Point-estimate validation tolerates only serialization-level rounding, not changed predictions or cohorts.
         if not np.isclose(point.value, uncertainty.value, rtol=1e-10, atol=1e-12, equal_nan=True):
             raise ValueError(f"Bootstrap and point estimates disagree: {key}.")
 
         for column in ("n", "cases", "controls", "status", "reason", "split", "score", "family"):
-            if column in rows:
-                values = rows[column].fillna("")
+            if column in rows and rows[column].fillna("").nunique() != 1:
+                raise ValueError(f"Bootstrap and point {column} disagree: {key}.")
 
-                if values.nunique() != 1:
-                    raise ValueError(f"Bootstrap and point {column} disagree: {key}.")
-
-        # Preserve failed uncertainty as NE; never substitute a duplicate successful run.
+        # Failed uncertainty remains NE without substitution from a duplicate successful run.
         combined.append(rows.loc[bootstrapped])
 
     return pd.concat(combined, ignore_index=True)
 
 
-# Read only metric tables; prediction files in the same directory are not loaded.
+# Result loading reads only metric tables, excluding prediction files in the same directory.
 def read_results(path):
     path = Path(path)
+    print(f"Loading evaluation results: {path}", flush=True)
     paths = [path] if path.is_file() else sorted(path.rglob("*.tsv"))
     tables = []
+
     for filename in paths:
         header = pd.read_csv(filename, sep="\t", nrows=0).columns
 
@@ -123,13 +124,17 @@ def read_results(path):
     if expected_split.isna().any() or not data.split.eq(expected_split).all():
         raise ValueError("Expected held-out UKB (test) or CARTaGENE transfer (all) evaluations.")
 
+    # Optional metadata defaults precede result matching across files.
     defaults = {"source": "", "window_mb": 0, "panel": "main", "train_group": "all",
                 "group": "all", "train_size": "full", "covariate_set": "standard"}
+
     for column, default in defaults.items():
         if column not in data:
             data[column] = default
+
         data[column] = data[column].fillna(default)
 
+    # Label normalization makes sizes, cohorts and evaluation strata consistent.
     data["train_size"] = data.train_size.astype(str).str.replace(r"\.0$", "", regex=True)
     data["window_mb"] = pd.to_numeric(data.window_mb)
     data["scenario"] = data.cohort.map(scenario_labels)
@@ -145,9 +150,11 @@ def read_results(path):
 # Scientific selections are explicit and preserve non-estimable values.
 def select_results(data, **filters):
     selected = data
+
     for column, value in filters.items():
         selected = selected.loc[selected[column].isin(value) if isinstance(value, (list, tuple, set))
                                 else selected[column].eq(value)]
+
     return selected.copy()
 
 
@@ -194,7 +201,9 @@ def benchmark_rows(data, cohort, phenotype, group="all", train_group="all", metr
     if set(frame.loc[frame.method.eq("single"), "source"]) != set(source_labels(phenotype)):
         raise ValueError(f"Incomplete source panel: {cohort}/{phenotype}/{group}")
 
+    # Method selection returns one estimate per displayed method and window resolution.
     records = []
+
     for method, mb in (("single", 0), ("multiprs", 0), ("blocprs", 1), ("blocprs", 3), ("blocprs", 5)):
         row = method_row(frame, method, mb).to_dict()
         row["method_token"] = method
@@ -214,6 +223,7 @@ def benchmark_rows(data, cohort, phenotype, group="all", train_group="all", metr
 def load_benchmark(path, cohort, non_eur_eval=False, non_eur_train=False):
     data = read_results(path)
     records = []
+
     for family, names in phenotypes.items():
         for phenotype in names:
 
@@ -227,6 +237,7 @@ def load_benchmark(path, cohort, non_eur_eval=False, non_eur_train=False):
             # Focused benchmarks omit sparse binary transfers and uniformly weak predictions.
             if cohort == "cartagene" and family == "binary" and frame.cases.iloc[0] < 100:
                 continue
+
             if frame.value.max() < .01 or not frame.value.notna().any():
                 continue
 
@@ -248,7 +259,9 @@ def display_phenotype(name):
 
     for suffix in ("_MA", "_MT", "_SEX"):
         label = label.removesuffix(suffix)
+
     label = "FEV1/FVC" if label == "FEV1_FVC" else label.replace("_", " ")
+
     return label + ("\u2020" if logged else "")
 
 
@@ -293,6 +306,8 @@ def load_regional_interpretation(data_root, analysis_dir=None):
                   "FEV1_FVC_MA", "SBP_MA", "TC_ADJ_MA", "LOG_TG_MA", "LDL_ADJ_MA", "LOG_TST_SEX"]
     binary = ["ASTHMA_MA", "CAD_MT", "AF_MT", "ASTHMA_MT", "GOUT_MT", "HF_MT", "HTN_MT",
               "STR_MT", "T1D_MT", "T2D_MA", "T2D_MT", "DEM_MT"]
+
+    # The combined context contains per-phenotype contribution tables.
     analysis_dir = Path(analysis_dir) if analysis_dir is not None else Path(data_root) / "analyses/interpretation"
     paths = sorted(Path(analysis_dir).glob("*/contributions.tsv"))
     context = pd.concat([pd.read_csv(path, sep="\t") for path in paths], ignore_index=True)
@@ -305,11 +320,14 @@ def load_regional_interpretation(data_root, analysis_dir=None):
     if not context.window_size.eq("mb1").all():
         raise ValueError("These interpretation figures require 1-Mb windows.")
 
+    # Context labels follow the paper's phenotype order and source names from the panel tables.
     order = {name: index for index, name in enumerate(continuous + binary)}
     context = context.sort_values("phenotype", key=lambda names: names.map(order), kind="stable")
+
     for phenotype, indices in context.groupby("phenotype", sort=False).groups.items():
         context.loc[indices, "expert_label"] = context.loc[indices, "base"].map(
             source_labels(phenotype)).fillna(context.loc[indices, "expert_label"])
+
     return summarize_contributions(context)
 
 
@@ -319,6 +337,7 @@ def read_comparisons(path):
     paths = ([path.with_name(path.stem + "_comparisons.tsv")] if path.is_file()
              else sorted(path.rglob("*.tsv")))
     tables = []
+
     for filename in paths:
         header = pd.read_csv(filename, sep="\t", nrows=0).columns
 
@@ -331,7 +350,7 @@ def read_comparisons(path):
     return pd.concat(tables, ignore_index=True)
 
 
-# Match contrasts to the displayed sources, including optimistic source selection.
+# Paired contrasts match displayed sources, including optimistic source selection.
 def paired_tests(points, path, target="BLocPRS mb1", baselines=None):
     from math import erfc, sqrt
 
@@ -345,15 +364,20 @@ def paired_tests(points, path, target="BLocPRS mb1", baselines=None):
     for _, cell in points.groupby(keys, dropna=False, sort=False):
         selected = cell.set_index("method")
         target_row = selected.loc[target]
+
         for baseline in baselines:
             baseline_row = selected.loc[baseline]
+
+            # Paired-contrast selection matches all analysis settings.
             filters = {key: target_row[key] for key in keys}
             match = contrasts.copy()
+
             for key, value in filters.items():
                 values = match[key].fillna(defaults.get(key, "")).astype(str)
                 match = match.loc[values.eq(str(value))]
 
             match = match.loc[match.method.eq(target_row.method_token)]
+
             if "window_mb" in match:
                 match = match.loc[match.window_mb.eq(target_row.window_mb)]
 
@@ -362,12 +386,14 @@ def paired_tests(points, path, target="BLocPRS mb1", baselines=None):
 
             reference = str(baseline_row.method_token)
             keep = match.reference.eq(reference)
+
             if reference == "single":
 
-                # The paired test must use the same source selected for the displayed point.
+                # Source filtering matches the paired test to the source selected for the displayed point.
                 source = str(baseline_row.source)
                 keep = (match.reference.eq("source:" + source)
                         | (keep & match.get("reference_source", pd.Series("", index=match.index)).eq(source)))
+
             match = match.loc[keep]
 
             if len(match) != 1:
@@ -414,6 +440,7 @@ def attach_uncertainty(data, column="bootstrap_se"):
         raise ValueError(f"Missing or invalid {column} for an estimable result.")
 
     data["err"] = data[column]
+
     return data
 
 
@@ -421,6 +448,7 @@ def attach_uncertainty(data, column="bootstrap_se"):
 def load_sex_results(path):
     data = read_results(path)
     records = []
+
     for cohort in ("ukbb", "cartagene"):
         for phenotype in ("WHR_SEX", "URT_SEX", "LOG_CRTN_SEX", "LOG_TST_SEX"):
 
@@ -428,10 +456,12 @@ def load_sex_results(path):
                 continue
 
             trait = phenotype.removeprefix("LOG_").removesuffix("_SEX")
+
             for group in ("all", "female", "male"):
                 frame = select_results(data, cohort=cohort, phenotype=phenotype, group=group,
                                        train_group="all", train_size="full", panel="main",
                                        covariate_set="standard", metric="incremental_r2")
+
                 for method, mb, source, label in (
                     ("single", 0, f"PGS_{trait}_M", "Male PRS"),
                     ("single", 0, f"PGS_{trait}_F", "Female PRS"),
@@ -444,13 +474,14 @@ def load_sex_results(path):
                     records.append(row)
 
     values = attach_uncertainty(pd.DataFrame(records))
+
     if values.groupby(["cohort", "phenotype", "group"]).n.nunique().gt(1).any():
         raise ValueError("Sex-stratified methods evaluate different participant counts.")
 
     return values, paired_tests(values, path, baselines=["Male PRS", "Female PRS", "Nonwindowed MultiPRS"])
 
 
-# Pool phenotype-by-draw recovery values, retaining the published random-window IQR.
+# Pooled phenotype-by-draw recovery values retain the published random-window IQR.
 def local_recovery_band(controls, endpoints):
     band = controls.groupby(["Scenario", "RequestedFractionPct"]).LocalGainRecoveryPct.agg(
         q25=lambda values: np.percentile(values, 25), median="median", q75=lambda values: np.percentile(values, 75)).reset_index()
@@ -458,12 +489,14 @@ def local_recovery_band(controls, endpoints):
 
     # At zero and all windows, random selection adds no variability.
     ends["q25"], ends["q75"] = ends["median"], ends["median"]
+
     return pd.concat([band, ends]).sort_values(["Scenario", "RequestedFractionPct"])
 
 
-# Read the same fixed four-phenotype recovery comparison from packaged analyses.
+# Packaged analyses supply the same fixed four-phenotype recovery comparison.
 def load_packaged_recovery(analysis_dir, names, scenarios, fractions):
     curves, controls, endpoints = [], [], []
+
     for scenario in scenarios:
         for phenotype in names:
             path = Path(analysis_dir) / phenotype / "ablation" / scenario / "metrics.tsv"
@@ -476,6 +509,8 @@ def load_packaged_recovery(analysis_dir, names, scenarios, fractions):
             frame = frame.rename(columns={"phenotype": "Phenotype", "scenario": "Scenario"})
             frame["RequestedFractionPct"] = 100 * frame.fraction
             frame["LocalGainRecoveryPct"] = 100 * frame.recovery
+
+            # Separate subsets contain ranked ablations, random controls and shared endpoints.
             curve = frame.loc[frame["mode"].isin(("anchor_only", "full", "retain_top"))].copy()
             random = frame.loc[frame["mode"].eq("retain_random")].copy()
             ends = curve.loc[curve["mode"].isin(("anchor_only", "full"))].copy()
@@ -492,6 +527,7 @@ def load_packaged_recovery(analysis_dir, names, scenarios, fractions):
             curves.append(curve)
             controls.append(random)
             endpoints.append(ends)
+
     return pd.concat(curves, ignore_index=True), local_recovery_band(
         pd.concat(controls, ignore_index=True), pd.concat(endpoints, ignore_index=True))
 
@@ -525,6 +561,7 @@ def load_compact_benchmarks(path, non_eur=False, metric=None):
     candidates = ({"binary": phenotypes["binary"]} if metric == "auroc" else
                   phenotypes if non_eur else compact_phenotypes)
     records = []
+
     for cohort in ("ukbb", "cartagene"):
         for family, names in candidates.items():
             for phenotype in names:
@@ -535,6 +572,7 @@ def load_compact_benchmarks(path, non_eur=False, metric=None):
                 for group in (("non-EUR",) if non_eur else ("all", "EUR", "non-EUR")):
                     records.append(benchmark_rows(data, cohort, phenotype, group,
                                                   "non-EUR" if non_eur else "all", metric))
+
     return pd.concat(records, ignore_index=True), candidates
 
 
@@ -546,6 +584,7 @@ def attach_compact_bootstrap(data, path, non_eur=False):
 def load_progression(path, cohort):
     data = read_results(path)
     records = []
+
     for phenotype, family in core_phenotypes:
 
         if cohort == "cartagene" and phenotype in {"LOG_TST_SEX", "DEM_MT"}:
@@ -555,7 +594,7 @@ def load_progression(path, cohort):
                                train_group="all", train_size="full", panel="main",
                                covariate_set="standard", metric=metric_tokens[family])
 
-        # The two source maxima must compare the same complete panel on the same cohort.
+        # Panel validation ensures both source maxima compare the same complete panel on the same cohort.
         raw = select_results(frame, method="single", window_mb=0)
         regional = select_results(frame, method="regional_single", window_mb=1)
         expected = set(source_labels(phenotype))
@@ -569,9 +608,7 @@ def load_progression(path, cohort):
         if pd.concat([raw, regional]).n.nunique() != 1:
             raise ValueError(f"Raw/regional sources use different participant counts: {phenotype}")
 
-        expected_split = "test" if cohort == "ukbb" else "all"
-
-        if not frame.split.eq(expected_split).all():
+        if not frame.split.eq("test" if cohort == "ukbb" else "all").all():
             raise ValueError(f"Unexpected evaluation split: {phenotype}/{cohort}")
 
         for method, mb in (("single", 0), ("regional_single", 1), ("multiprs", 0),
@@ -606,7 +643,7 @@ regional_specs = (
 )
 
 
-# Read coefficient and input-SD tracks, with GWAS restricted to modeled windows.
+# Regional inputs include coefficient and input-SD tracks, with GWAS restricted to modeled windows.
 def load_regional_panel(data_root, spec, analysis_dir, gwas_template):
     from analyses.interpretation.window_analysis import gwas_chunks
 
@@ -624,9 +661,11 @@ def load_regional_panel(data_root, spec, analysis_dir, gwas_template):
     # Source/window uniqueness prevents averaging inconsistent coefficients.
     if effects.duplicated(["expert_label", "window"]).any():
         raise ValueError(f"Duplicate source/window coefficients: {phenotype}")
+
     if set(effects.expert_label) != set(spec["sources"]):
         raise ValueError(f"Unexpected PRS sources: {phenotype}")
 
+    # Modeled windows follow genomic position rather than stored row order.
     windows = effects[["window", "start_bp", "end_bp"]].drop_duplicates().sort_values("start_bp")
     starts = windows.start_bp.to_numpy(float)
     ends = windows.end_bp.to_numpy(float)
@@ -646,27 +685,31 @@ def load_regional_panel(data_root, spec, analysis_dir, gwas_template):
     # Effective coefficients combine the anchor and centered local adjustment.
     if not all(np.isfinite(values).all() for values in (*coefficients, variance, sd)):
         raise ValueError(f"Incomplete coefficient/input-scale tracks: {phenotype}")
+
     if np.any(sd < 0) or not np.allclose(sd ** 2, variance, rtol=1e-7, atol=1e-12):
         raise ValueError(f"Inconsistent training PRS variance and SD: {phenotype}")
+
     if not np.allclose(coefficients[0], coefficients[1] + coefficients[2], rtol=1e-7, atol=1e-10):
         raise ValueError(f"Effective coefficient identity failed: {phenotype}")
 
+    # Each ancestry or sex represented in the panel has its own association scan.
     short_name = phenotype.removesuffix("_MA").removesuffix("_SEX")
     suffix = "logistic.hybrid" if short_name == "ASTHMA" else "linear"
     gwas = {}
+
     for source in spec["sources"]:
         group = source.lower() if source in {"Female", "Male"} else source
         path = Path(gwas_template.format(phenotype=phenotype, chromosome=spec["chromosome"],
                                         group=group, suffix=suffix))
         counts = dict(n_failed_tests=0, n_missing_p=0, n_zero_p=0, n_valid_variants=0)
 
-        # Use the concentration analysis's successful-test filter, but retain uncapped logP for maps.
+        # Maps use the concentration analysis's successful-test filter and retain uncapped logP.
         chunks = [pd.DataFrame({"POS": positions, "LOGP": logp})
                   for positions, logp in gwas_chunks(path, spec["chromosome"], counts)]
         points = pd.concat(chunks, ignore_index=True)
 
         # GWAS positions and stored windows are both one-based inclusive.
-        # Find the last window start at or before each SNP, then check its end to exclude gaps.
+        # Window lookup finds the last start at or before each SNP and checks the end to exclude gaps.
         indices = np.searchsorted(starts, points.POS.to_numpy(), side="right") - 1
         covered = (indices >= 0) & (points.POS.to_numpy() <= ends[np.maximum(indices, 0)])
         points = points.loc[covered].sort_values("POS")
@@ -697,6 +740,8 @@ metric_labels = {"continuous": r"Incremental $R^2$", "binary": r"Nagelkerke $R^2
 # Sample-size tables contain both the full fit and the training subsets.
 def load_training_sizes(path):
     data = read_results(path)
+
+    # Selection retains primary models and outcome metrics across full and subsample fits.
     data = select_results(data, group="all", train_group="all", covariate_set="standard", panel="main")
     data = data.loc[data.phenotype.isin([name for name, _ in core_phenotypes])]
     data = data.loc[((data.method.eq("blocprs") & data.window_mb.eq(1))
@@ -705,6 +750,7 @@ def load_training_sizes(path):
     data["model"] = [display_method(method, mb) for method, mb in zip(data.method, data.window_mb)]
     data["size"] = data.train_size.map(lambda size: size if size == "full" else int(size))
 
+    # Coverage validation is separate from each phenotype's sample-size series.
     expected_phenotypes = {(cohort, phenotype) for cohort in ("ukbb", "cartagene")
                            for phenotype, _ in core_phenotypes
                            if cohort == "ukbb" or phenotype not in {"LOG_TST_SEX", "DEM_MT"}}
@@ -717,6 +763,7 @@ def load_training_sizes(path):
 
     expected = {(size, model) for size in (2500, 5000, 12500, 25000, 50000, 100000, "full")
                 for model in ("Nonwindowed MultiPRS", "BLocPRS mb1")}
+
     for key, cell in data.groupby(["cohort", "phenotype"]):
 
         if set(zip(cell["size"], cell.model)) != expected:
@@ -729,8 +776,10 @@ def phenotype_label(name):
     label = display_phenotype(name)
     label = {"HEIGHT": "Height", "LDL": "LDL-C", "HDL\u2020": "HDL-C\u2020",
              "ASTHMA": "Asthma"}.get(label, label)
+
     if name in {"ASTHMA_MA", "T2D_MA"}:
         label += " (MA)"
     elif name in {"ASTHMA_MT", "T2D_MT"}:
         label += " (RT)"
+
     return label

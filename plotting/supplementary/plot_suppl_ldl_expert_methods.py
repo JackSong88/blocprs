@@ -24,6 +24,7 @@ keys = ["expert", "cohort", "stratum", "method"]
 def load_results(path):
     data = read_results(path)
     records = []
+
     for expert, _ in experts:
         for cohort in cohorts:
             for group, label in (("all", "Full"), ("EUR", "EUR"), ("non-EUR", "Non-EUR")):
@@ -47,6 +48,7 @@ def load_results(path):
 
     tests = paired_tests(result, path, target=methods[-1], baselines=methods[:2])
     tests["expert"] = tests.panel
+
     return result, tests
 
 
@@ -55,10 +57,12 @@ def build_figure(data, comparisons):
     figure.subplots_adjust(left=0.082, right=0.987, top=0.845, bottom=0.17, wspace=0.16, hspace=0.60)
     upper = ceil(((data.value + data.bootstrap_se).max() + 0.04) / 0.02) * 0.02
     lookup = data.set_index(keys).sort_index()
+
     for column, (expert, title) in enumerate(experts):
         box = axes[0, column].get_position()
         figure.text(box.x0, 0.957, "ABC"[column], fontsize=8.5, fontweight="bold", va="top")
         figure.text((box.x0 + box.x1) / 2, 0.957, title, fontsize=7.5, ha="center", va="top")
+
         for row, cohort in enumerate(cohorts):
             ax = axes[row, column]
             style_axis(ax)
@@ -67,42 +71,57 @@ def build_figure(data, comparisons):
             ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
             ax.tick_params(length=2.4, labelsize=6.3, left=column == 0, labelleft=column == 0)
             ax.spines["left"].set_visible(column == 0)
+
             for group_index, (_, _, group) in enumerate(groups):
                 prefix = (expert, cohort, group)
+
                 for method_index, (method, color) in enumerate(zip(methods, compact_colors[:3])):
                     record = lookup.loc[prefix + (method,)]
                     x = group_index + (method_index - 1) * 0.19
                     ax.bar(x, record.value, width=0.16, color=color, edgecolor="#666666", linewidth=0.22, zorder=3)
                     ax.errorbar(x, record.value, yerr=record.bootstrap_se, fmt="none",
                                 ecolor="#333333", elinewidth=0.55, capsize=0, zorder=4)
+
+                # Paired-test brackets sit above this group's uncertainty bars.
                 selected = lookup.loc[prefix]
                 top = (selected.value + selected.bootstrap_se).max()
                 tests = comparisons.loc[comparisons.expert.eq(expert) & comparisons.cohort.eq(cohort)
                                         & comparisons.stratum.eq(group)].set_index("baseline")
                 level = 0
+
                 for baseline in reversed(methods[:2]):
                     test = tests.loc[baseline]
-                    if test.p >= 0.05:
+
+                    if not np.isfinite(test.p) or not 0 <= test.p < 0.05:
                         continue
+
                     x = group_index + (methods.index(baseline) - 1) * 0.19
                     draw_comparison(ax, x, group_index + 0.19, test.p, top + 0.005 + level * 0.016, 0.004)
                     level += 1
+
+    # Expert panels share cohort headings and the method legend.
     center = (0.082 + 0.987) / 2
+
     for row, title in enumerate(["Held-out UK Biobank", r"UK Biobank $\rightarrow$ CARTaGENE transfer"]):
         figure.text(center, axes[row, 0].get_position().y1 + 0.022, title, ha="center", va="bottom", fontsize=7.2)
+
     figure.text(0.018, 0.505, r"Incremental $R^2$", rotation=90, ha="center", va="center", fontsize=7.2)
     figure.text(center, 0.092, "Evaluation group", fontsize=6.7, ha="center", va="center")
     figure.legend(handles=[Patch(facecolor=color, label=method) for color, method in zip(compact_colors[:3], methods)],
                   loc="lower center", bbox_to_anchor=(center, 0.018), ncol=3, frameon=False,
                   fontsize=6.4, handlelength=1.8, handletextpad=0.5, columnspacing=2)
+
     return figure
 
 
 def main():
     args = parse_args(__doc__, supplementary=True, collection="ldl_experts")
+
+    # Each expert construction method has estimates and paired comparisons.
     data, comparisons = load_results(args.results)
+
     with plt.rc_context(style):
-        print(save_figure(build_figure(data, comparisons), args.output_dir / "suppl_ldl_expert_methods.pdf"))
+        save_figure(build_figure(data, comparisons), args.output_dir / "suppl_ldl_expert_methods.pdf")
 
 
 if __name__ == "__main__":

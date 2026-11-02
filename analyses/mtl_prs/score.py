@@ -1,6 +1,8 @@
 """Score MTL-PRS candidates, select on validation data, and export SNP effects."""
 
 import gzip
+import logging
+from time import monotonic
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +13,7 @@ from blocprs.metrics import IncrementalR2, NagelkerkeR2
 from .genotypes import PgenDosages
 
 
-# Keep participant IDs in their supplied order and reject duplicate pairs.
+# Participant ID validation preserves the supplied order and rejects duplicate pairs.
 def _sample_ids(ids):
     ids = np.asarray(ids, dtype=str)
 
@@ -24,7 +26,7 @@ def _sample_ids(ids):
     return ids
 
 
-# Resolve one selected candidate or keep the complete candidate matrix.
+# Candidate lookup returns the selected candidate or the complete candidate matrix.
 def _candidate_effects(model, candidate_label):
     labels = model["candidate_labels"].astype(str)
     beta = np.asarray(model["beta_raw"], dtype=np.float64)
@@ -46,13 +48,12 @@ def _candidate_effects(model, candidate_label):
     return labels, beta
 
 
-# Score validation or test IDs with ALT-dosage effects and training-mean imputation.
+# Validation and test scoring uses ALT-dosage effects and training-mean imputation.
 def score_chromosome(genotype_prefix, model_path, ids, output, candidate_label=None,
                      variant_batch_size=512):
     ids = _sample_ids(ids)
 
-    if variant_batch_size < 1:
-        raise ValueError("variant_batch_size must be positive.")
+    assert variant_batch_size >= 1
 
     with np.load(model_path, allow_pickle=False) as model, PgenDosages(genotype_prefix) as reader:
         labels, beta = _candidate_effects(model, candidate_label)
@@ -61,7 +62,7 @@ def score_chromosome(genotype_prefix, model_path, ids, output, candidate_label=N
         means = np.asarray(model["training_mean"], dtype=np.float64)
         train_ids = pd.MultiIndex.from_arrays([model["train_fid"].astype(str), model["train_iid"].astype(str)])
 
-        # Update-training participants cannot serve as validation or test participants.
+        # Scoring rejects update-training participants in validation or test IDs.
         if pd.MultiIndex.from_arrays(ids.T).isin(train_ids).any():
             raise ValueError("Scoring IDs overlap the MTL update-training participants.")
 
@@ -69,7 +70,7 @@ def score_chromosome(genotype_prefix, model_path, ids, output, candidate_label=N
             or len(np.unique(indices)) != len(indices) or not np.isfinite(means).all()):
             raise ValueError("Model variant rows, effects and training means are inconsistent.")
 
-        # Saved indices must still refer to the same variants and allele orientation.
+        # Variant checks verify that saved indices retain the same variant identities and allele orientation.
         actual = reader.variants.iloc[indices]
         matching = all(np.array_equal(actual[column].to_numpy(dtype=str), model[column].astype(str))
                        for column in ("snp", "ref", "alt", "position"))
@@ -80,6 +81,8 @@ def score_chromosome(genotype_prefix, model_path, ids, output, candidate_label=N
         samples = reader.sample_indices(ids)
         scores = np.zeros((len(ids), len(labels)), dtype=np.float64)
 
+        # Small variant batches accumulate each candidate's score.
+        started = last_report = monotonic()
         for start in range(0, len(indices), variant_batch_size):
             rows = slice(start, min(start + variant_batch_size, len(indices)))
             dosage = reader.read(indices[rows], samples).astype(np.float64)
@@ -88,15 +91,24 @@ def score_chromosome(genotype_prefix, model_path, ids, output, candidate_label=N
             dosage = np.where(np.isfinite(dosage), dosage, means[rows])
             scores += dosage @ beta[rows]
 
+            now = monotonic()
+            if now - last_report >= 30 or rows.stop == len(indices):
+                logging.getLogger(__name__).info("chr%s: scored %s/%s variants; elapsed=%.1fs",
+                                                 chromosome, rows.stop, len(indices), now - started)
+                last_report = now
+
+    # The score archive stores participant IDs alongside candidate scores.
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+
     with output.open("wb") as handle:
         np.savez(handle, chromosome=chromosome, fid=ids[:, 0], iid=ids[:, 1],
                  candidate_labels=labels, scores=scores)
+
     return output
 
 
-# Sum a complete chromosome set without reordering participants or candidates.
+# Genome-wide scores sum a complete chromosome set without reordering participants or candidates.
 def combine_scores(paths, ids, chromosomes=range(1, 23)):
     ids = _sample_ids(ids)
     expected = set(map(int, chromosomes))
@@ -135,7 +147,7 @@ def combine_scores(paths, ids, chromosomes=range(1, 23)):
     return labels, total
 
 
-# Candidate zero must reconstruct the calibrated raw source mixture genome-wide.
+# Candidate-zero validation checks genome-wide reconstruction of the calibrated raw source mixture.
 def check_baseline(scores, source_scores, pi, theta):
     observed = np.asarray(scores, dtype=np.float64)
     expected = np.asarray(source_scores, dtype=np.float64) @ np.asarray(pi, dtype=np.float64) * float(theta)
@@ -144,7 +156,7 @@ def check_baseline(scores, source_scores, pi, theta):
         or not np.isfinite(observed).all() or not np.isfinite(expected).all()):
         raise ValueError("Baseline reconstruction requires aligned finite score vectors.")
 
-    # Allele reversal can add a constant; compare centered predictions.
+    # Centered prediction comparisons remove constants introduced by allele reversal.
     observed, expected = observed - observed.mean(), expected - expected.mean()
     observed_ss, expected_ss = np.dot(observed, observed), np.dot(expected, expected)
 
@@ -155,9 +167,8 @@ def check_baseline(scores, source_scores, pi, theta):
     correlation = float(np.dot(observed, expected) / np.sqrt(observed_ss * expected_ss))
     rmse = float(np.sqrt(np.mean(difference ** 2)))
     relative_rmse = rmse / np.sqrt(expected_ss / (len(expected) - 1))
-    passing = correlation >= .99999 and relative_rmse <= 1e-4
 
-    if not passing:
+    if not (correlation >= .99999 and relative_rmse <= 1e-4):
         raise ValueError(f"Baseline reconstruction failed: correlation={correlation:.8g}, "
                          f"relative_rmse={relative_rmse:.8g}")
 
@@ -167,7 +178,7 @@ def check_baseline(scores, source_scores, pi, theta):
             "max_absolute_centered_difference": float(np.max(np.abs(difference))), "passing": True}
 
 
-# Select the best frozen candidate using only the disjoint validation outcomes.
+# Candidate selection uses only the disjoint validation outcomes.
 def select_candidate(y, covariates, labels, scores, family):
     labels = np.asarray(labels, dtype=str)
     scores = np.asarray(scores, dtype=np.float64)
@@ -178,14 +189,17 @@ def select_candidate(y, covariates, labels, scores, family):
 
     metric_type = {"gaussian": IncrementalR2, "binomial": NagelkerkeR2}[family]
     metric = metric_type(y, covariates)
+
+    # Every frozen candidate shares the same covariate-only evaluation fit.
     values = np.asarray([metric.score(scores[:, index]) for index in range(len(labels))])
     selected = int(np.argmax(values))
+
     return pd.DataFrame({"candidate_label": labels, "candidate_index": np.arange(len(labels)),
                          "metric": "Incremental_R2" if family == "gaussian" else "Nagelkerke_R2",
                          "value": values, "selected": np.arange(len(labels)) == selected})
 
 
-# Export selected ALT-allele effects and imputation means without genotype data.
+# Weight export includes selected ALT-allele effects and imputation means without genotype data.
 def export_weights(model_paths, label, output):
     if label is None:
         raise ValueError("Choose one candidate label for SNP-weight export.")

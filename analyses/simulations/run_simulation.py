@@ -1,6 +1,7 @@
 """Fit and evaluate one LDL or asthma simulation on the stored train/test split."""
 
 import argparse
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PANELS = {"LDL_MA": "LDL", "ASTHMA_MA": "ASTHMA"}
 
 
-# Select one scenario; the model grid and CV settings match the primary suite.
+# The CLI selects one scenario; the model grid and CV settings match the primary suite.
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True, help="Stage-5 window-score dataset directory.")
@@ -28,10 +29,14 @@ def parse_args(argv=None):
     parser.add_argument("--window-map", type=Path, default=ROOT / "tables/windows_GRCh37_1Mb.tsv")
     parser.add_argument("--seed", type=int, default=20260722)
     parser.add_argument("--block-size", type=int, default=8192)
+    parser.add_argument("--cv-workers", type=int, default=1, help="Concurrent CV folds (default: 1).")
+    parser.add_argument("--fit-workers", type=int, default=1, help="CPUs for the final fit (default: 1).")
+    parser.add_argument("--cache-dir", type=Path, help="Directory for temporary model caches.")
+
     return parser.parse_args(argv)
 
 
-# Isolate the fitted regional predictor using the model's own training scaling.
+# Regional prediction uses the fitted model's own training scaling.
 def regional_prediction(model, data, block_size):
     prediction = np.empty(data.n_samples, dtype=np.float64)
     eta_centered = model.eta_centered_
@@ -51,10 +56,11 @@ def regional_correlation(truth, fitted):
     truth = truth - truth.mean()
     fitted = fitted - fitted.mean()
     denominator = np.sqrt(np.dot(truth, truth) * np.dot(fitted, fitted))
+
     return float(np.dot(truth, fitted) / denominator) if denominator > 0 else np.nan
 
 
-# Express recovery relative to the known global predictor, without clipping.
+# Recovery is relative to the known global predictor, without clipping.
 def recovery_percentages(values, architecture):
     gap = values["simulation_truth"] - values["true_genomewide_component"]
 
@@ -68,10 +74,11 @@ def recovery_percentages(values, architecture):
     global_value = values["true_genomewide_component"]
     multiprs = 100 * (values["nonwindowed_multiprs"] - global_value) / gap
     blocprs = 100 * (values["blocprs_full"] - global_value) / gap
+
     return multiprs, blocprs, gap, "ok"
 
 
-# Keep the generating coefficients, outcomes and frozen scores in one archive.
+# The truth archive stores generating coefficients, outcomes and frozen scores together.
 def save_truth(path, simulation, predictions, regional, args):
     truth = simulation.truth
     arrays = {
@@ -95,31 +102,40 @@ def save_truth(path, simulation, predictions, regional, args):
 
     for split in ("train", "test"):
         ids = getattr(simulation, split).sample_ids
+
         if ids is not None:
             arrays[f"{split}_ids"] = np.asarray(ids, dtype=str)
 
     np.savez_compressed(path, **arrays)
 
 
-# Fit both estimators on training rows and evaluate frozen scores on test rows.
+# Both estimators fit training rows; frozen-score evaluation uses test rows.
 def run_simulation(args):
     output = args.output_dir / args.panel / args.architecture / f"replicate_{args.replicate:02d}"
 
-    # Refuse an existing scenario directory, including an incomplete earlier run.
+    # Directory creation rejects existing scenarios, including incomplete earlier runs.
     output.mkdir(parents=True, exist_ok=False)
+    logging.info("Generating %s %s replicate=%02d", args.panel, args.architecture, args.replicate)
     simulation = prepare_simulation(args.dataset, args.window_map, args.panel,
                                     args.architecture, args.replicate, args.seed, args.block_size)
+
+    # The genome-wide MultiPRS comparison sums the same window inputs.
     train_global = genomewide_data(simulation.train, args.block_size)
     test_global = genomewide_data(simulation.test, args.block_size)
 
     multiprs = MultiPRS(simulation.family, variant="unregularized", block_size=args.block_size)
+    logging.info("Fitting unregularized MultiPRS")
     multiprs.fit(train_global)
 
+    # BLocPRS fitting uses training-only penalty selection on the primary grid.
+    logging.info("Fitting BLocPRS with five-fold training-only CV")
     model = BLocPRS(simulation.family, lambda_grid=np.logspace(-3, 3, 25), cv_folds=5,
-                   cv_max_samples=50000, random_state=42, block_size=args.block_size)
+                   cv_max_samples=50000, random_state=42, block_size=args.block_size,
+                   cv_workers=args.cv_workers, fit_workers=args.fit_workers, cache_dir=args.cache_dir)
     model.fit(simulation.train)
 
     # Each comparison uses the same held-out participants and covariate-only fit.
+    logging.info("Evaluating frozen scores on %d test participants", simulation.test.n_samples)
     metric_type = IncrementalR2 if simulation.family == "gaussian" else NagelkerkeR2
     metric = metric_type(simulation.test.y, simulation.test.covariates)
     single_values = [metric.score(test_global.window_scores[:, 0, k])
@@ -137,6 +153,8 @@ def run_simulation(args):
     values = {"oracle_best_single": float(single_values[best_source])}
     values.update({name: metric.score(score) for name, score in predictions.items()
                    if name != "oracle_best_single"})
+
+    # Regional correlation compares recovered predictions with the known simulated component.
     regional = regional_prediction(model, simulation.test, args.block_size)
     correlation = regional_correlation(simulation.test_regional, regional)
     multiprs_recovery, blocprs_recovery, gap, status = recovery_percentages(values, args.architecture)
@@ -150,6 +168,7 @@ def run_simulation(args):
         "n_train": simulation.train.n_samples, "n_test": simulation.test.n_samples,
         "selected_lambda": model.selected_lambda_,
         "cv_folds": 5, "cv_max_samples": 50000, "cv_seed": 42,
+        "cv_workers": args.cv_workers, "fit_workers": args.fit_workers,
         "oracle_best_source": test_global.source_names[best_source],
         **values,
         "nonwindowed_multiprs_recovery_pct": multiprs_recovery,
@@ -158,17 +177,20 @@ def run_simulation(args):
         "heldout_regional_predictor_correlation": correlation,
     }
 
+    # Saved models and truth arrays support reconstruction of this replicate.
     model.save(output / "model.npz")
     multiprs.save(output / "multiprs.npz")
     save_truth(output / "truth.npz", simulation, predictions, regional, args)
 
-    # Write the result row last, only after fitting, evaluation and archive saving succeed.
+    # Result-row export follows successful fitting, evaluation and archive saving.
     pd.DataFrame([result]).to_csv(output / "results.tsv", sep="\t", index=False, na_rep="NA")
     print(f"{args.panel} {args.architecture} replicate={args.replicate:02d} "
           f"lambda={model.selected_lambda_:g} MultiPRS={values['nonwindowed_multiprs']:.6g} "
           f"BLocPRS={values['blocprs_full']:.6g} results={output / 'results.tsv'}")
+
     return result
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     run_simulation(parse_args())

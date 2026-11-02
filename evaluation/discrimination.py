@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 
-# Compare cases with controls, giving tied scores half credit.
+# Compares cases with controls, giving tied scores half credit.
 def delong_covariance(y, scores):
     y = np.asarray(y)
     scores = np.asarray(scores, dtype=float)
@@ -23,6 +23,7 @@ def delong_covariance(y, scores):
         return np.full(scores.shape[1], np.nan), np.full((scores.shape[1], scores.shape[1]), np.nan)
 
     case_placements, control_placements = [], []
+
     for score in scores.T:
         cases, controls = score[y == 1], score[y == 0]
         sorted_cases, sorted_controls = np.sort(cases), np.sort(controls)
@@ -36,6 +37,7 @@ def delong_covariance(y, scores):
         right = np.searchsorted(sorted_cases, controls, side="right")
         control_placements.append(1 - (left + right) / (2 * m))
 
+    # Combines case and control contributions to the covariance between methods.
     v, w = np.asarray(case_placements), np.asarray(control_placements)
     covariance = np.full((scores.shape[1], scores.shape[1]), np.nan)
 
@@ -45,7 +47,7 @@ def delong_covariance(y, scores):
     return v.mean(axis=1), covariance
 
 
-# Report raw-score AUROC without fitting covariates or reversing score directions.
+# Reports raw-score AUROC without fitting covariates or reversing score directions.
 def evaluate_auroc(y, scores, references=()):
     y = np.asarray(y)
     methods = list(scores)
@@ -70,7 +72,7 @@ def evaluate_auroc(y, scores, references=()):
 
             difference = values[j] - values[k]
 
-            # Shared participants make the two AUROCs correlated, so retain their covariance.
+            # The variance of the AUROC difference accounts for covariance from shared participants.
             variance = covariance[j, j] + covariance[k, k] - 2 * covariance[j, k]
             se, p, status = np.nan, np.nan, "sparse_class"
 

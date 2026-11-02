@@ -3,6 +3,8 @@
 import argparse
 import csv
 import gzip
+import logging
+from time import monotonic
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -23,12 +25,12 @@ else:
     from discrimination import evaluate_auroc
 
 
-# Align external scores to the selected participants without dropping anyone.
+# Aligns external scores to the selected participants without dropping anyone.
 def load_scores(path, sample_ids, columns=None, phenotype=None):
     path = Path(path)
     open_table = gzip.open if path.suffix == ".gz" else open
 
-    # Check headers before pandas renames duplicate columns.
+    # Checks headers before pandas renames duplicate columns.
     with open_table(path, "rt", newline="") as stream:
         header = next(csv.reader(stream, delimiter="\t"))
 
@@ -57,15 +59,14 @@ def load_scores(path, sample_ids, columns=None, phenotype=None):
     # .loc follows the requested ID order and raises for missing rows instead of taking an intersection.
     aligned = table.loc[selected_ids]
 
-    if phenotype is not None and "phenotype" in aligned:
-
-        if not np.array_equal(aligned["phenotype"].to_numpy(dtype=float), phenotype):
-            raise ValueError("Prediction phenotypes differ from the evaluation dataset.")
+    if (phenotype is not None and "phenotype" in aligned
+        and not np.array_equal(aligned["phenotype"].to_numpy(dtype=float), phenotype)):
+        raise ValueError("Prediction phenotypes differ from the evaluation dataset.")
 
     return aligned[columns].astype(float).reset_index(drop=True)
 
 
-# Keep sparse groups visible without reporting unstable calibrated estimates.
+# Identifies sparse groups for reporting without unstable calibrated estimates.
 def reporting_reason(y, family):
     if len(y) < 30:
         return f"Reporting requires at least 30 participants; found {len(y)}."
@@ -79,13 +80,13 @@ def reporting_reason(y, family):
     return ""
 
 
-# Apply the shared metric to every method on exactly the same evaluation rows.
+# Applies the shared metric to every method on exactly the same evaluation rows.
 def evaluate_scores(data, scores, family, split):
     y = np.asarray(data.y, dtype=np.float64)
     covariates = np.asarray(data.covariates, dtype=np.float64)
     values = scores.to_numpy(dtype=np.float64)
 
-    # Invalid data must fail, even when a metric would otherwise be non-estimable.
+    # Invalid data raises an error before metric estimability is assessed.
     if y.shape != (data.n_samples,) or not np.isfinite(y).all():
         raise ValueError("Evaluation requires one finite phenotype per participant.")
 
@@ -104,8 +105,9 @@ def evaluate_scores(data, scores, family, split):
     cases = int(np.count_nonzero(y == 1)) if binary else None
     controls = len(y) - cases if binary else None
 
-    # Reuse the covariate-only fit across all methods.
+    # Reuses the covariate-only fit across all methods.
     metric, null_failure = None, reporting_reason(y, family)
+
     if not null_failure:
         try:
             metric = metric_type(y, covariates)
@@ -113,6 +115,7 @@ def evaluate_scores(data, scores, family, split):
             null_failure = str(exc) or type(exc).__name__
 
     rows = []
+
     for name in scores:
         value, reason = np.nan, null_failure
 
@@ -129,13 +132,15 @@ def evaluate_scores(data, scores, family, split):
     return pd.DataFrame(rows)
 
 
-# Select named evaluation groups without changing predictions or participant order.
+# Selects named evaluation groups without changing predictions or participant order.
 def group_masks(participants, groups):
     for group in groups:
         mask = np.ones(len(participants), dtype=bool)
+
         for label in group.split(":"):
             if label == "all":
                 continue
+
             if label in ("female", "male"):
                 mask &= participants["Sex"].eq(0 if label == "female" else 1).to_numpy()
             elif label == "non-EUR":
@@ -146,12 +151,14 @@ def group_masks(participants, groups):
                     raise ValueError(f"Unknown or absent ancestry group: {label}")
 
                 mask &= participants["Ancestry"].eq(label).to_numpy()
+
         yield group, mask
 
 
-# Keep method, source and window size separate in the saved results.
+# Keeps method, source and window size separate in the saved results.
 def score_labels(columns, window_mb=0):
     rows = []
+
     for column in columns:
         name, separator, source = column.partition(":")
         match = re.fullmatch(r"(.+)_mb(\d+)", name)
@@ -168,20 +175,23 @@ def score_labels(columns, window_mb=0):
             raise ValueError(f"Name source scores as {method}:SOURCE, including the source identifier.")
 
         rows.append(dict(score=column, method=method, source=source, window_mb=mb))
+
     return pd.DataFrame(rows).set_index("score")
 
 
-# Compute only the fitted genome-wide component, with the same training scaling.
+# Computes only the fitted genome-wide component, with the same training scaling.
 def anchor_scores(model, data):
     values = np.empty(data.n_samples, dtype=float)
+
     for start in range(0, data.n_samples, model.block_size):
         rows = slice(start, min(start + model.block_size, data.n_samples))
         scores = model.scaler_.transform_windows(data.window_scores[rows])
         values[rows] = np.einsum("iwk,k->i", scores, model.gamma_, dtype=np.float64)
+
     return values
 
 
-# Attach the same scientific labels to point estimates and paired comparisons.
+# Attaches the same scientific labels to point estimates and paired comparisons.
 def label_results(table, labels, context):
     if table.empty:
         return table
@@ -189,26 +199,33 @@ def label_results(table, labels, context):
     table = table.copy()
     names = table["method"].tolist()
     table["score"] = names
+
     for column in ("method", "source", "window_mb"):
         table[column] = labels.loc[names, column].to_numpy()
 
     if "reference" in table:
         references = table["reference"].tolist()
         table["reference_score"] = references
+
         for column in ("method", "source", "window_mb"):
             output = "reference" if column == "method" else f"reference_{column}"
             table[output] = labels.loc[references, column].to_numpy()
 
     for name, value in context.items():
         table[name] = value
+
     return table
 
 
-# Evaluate each requested group using the same rows for every method.
+# Evaluates each requested group using the same rows for every method.
 def evaluate_groups(data, participants, scores, family, groups, split, metrics,
                     n_boot=0, seed=20260731, references=()):
     points, comparisons = [], []
+
     for group, mask in group_masks(participants, groups):
+        logging.info("Evaluating group %s: N=%s", group, int(mask.sum()))
+
+        # Subsets outcomes, covariates and all methods with the same participant mask.
         selected = SimpleNamespace(y=np.asarray(data.y)[mask],
                                    covariates=np.asarray(data.covariates)[mask],
                                    n_samples=int(mask.sum()))
@@ -224,11 +241,13 @@ def evaluate_groups(data, participants, scores, family, groups, split, metrics,
                     if result["status"].ne("OK").any():
                         raise NonEstimableError("At least one observed metric is non-estimable.")
 
+                    # Refits evaluation regressions within paired participant resamples.
                     uncertainty = bootstrap_metrics(selected.y, selected.covariates, values,
                                                     family=family, n_boot=n_boot, seed=seed)
                     result = result.merge(uncertainty.method_summary.drop(columns="observed"),
                                           on="method", validate="one_to_one")
                     result["uncertainty_status"] = "OK"
+
                     for reference in references:
                         paired = paired_comparisons(uncertainty, reference).rename(columns={
                             "bootstrap_se": "difference_se", "ci_lower": "difference_ci_lower",
@@ -239,8 +258,9 @@ def evaluate_groups(data, participants, scores, family, groups, split, metrics,
                         comparisons.append(paired)
                 except NonEstimableError as exc:
 
-                    # Keep failed uncertainty estimates visible; never discard bad resamples.
+                    # Records non-estimable bootstrap results as NE with their failure reason.
                     result["uncertainty_status"], result["uncertainty_reason"] = "NE", str(exc)
+
                     for reference in references:
                         for method in values:
                             if method != reference:
@@ -248,11 +268,15 @@ def evaluate_groups(data, participants, scores, family, groups, split, metrics,
                                     metric=result["metric"].iloc[0], group=group, n=selected.n_samples,
                                     status="NE", reason=str(exc), difference=np.nan, difference_se=np.nan,
                                     uncertainty_method="paired_bootstrap")]))
+
                 result["n_boot"], result["seed"] = n_boot, seed
                 result["uncertainty_method"] = "paired_bootstrap"
+
             points.append(result)
 
         if "auroc" in metrics:
+
+            # AUROC uses the genetic score directly, without covariate calibration.
             result, paired = evaluate_auroc(selected.y, values, references)
             reason = reporting_reason(selected.y, family)
 
@@ -276,8 +300,10 @@ def evaluate_groups(data, participants, scores, family, groups, split, metrics,
                                                   if comparisons else pd.DataFrame())
 
 
-# Load fixed genetic scores and write portable point-estimate and comparison tables.
+# Loads fixed genetic scores and writes portable point-estimate and comparison tables.
 def main():
+    started = monotonic()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, type=Path, help="Packaged dataset directory.")
     source = parser.add_mutually_exclusive_group(required=True)
@@ -340,11 +366,14 @@ def main():
     if args.predictions is not None and args.output.resolve() == args.predictions.resolve():
         parser.error("Results and predictions need different output paths.")
 
+    # Aligns evaluation metadata to the selected dataset rows.
+    logging.info("Loading evaluation dataset: %s; split=%s", args.dataset, args.split)
     data = load_dataset(args.dataset, split=args.split, ids_file=args.eval_ids)
     participants = read_participants(args.dataset).set_index(["FID", "IID"])
     participants = participants.loc[pd.MultiIndex.from_arrays(data.sample_ids.T)].reset_index()
 
     if args.model is not None:
+        logging.info("Loading model and predicting genetic scores: N=%s", data.n_samples)
         model = load_model(args.model)
 
         if args.family is not None and args.family != model.family:
@@ -355,8 +384,9 @@ def main():
 
         family = model.family
 
-        # Keep covariate effects, the intercept and sigmoid out of the PRS.
+        # The PRS excludes covariate effects, the intercept and sigmoid.
         data = select_sources(data, model.source_names_)
+
         if isinstance(model, FixedCompositionBLocPRS):
             name = f"fixed_composition_mb{args.window_mb}"
         elif isinstance(model, BLocPRS):
@@ -366,6 +396,7 @@ def main():
             name = f"calibrated_single:{model.source_names_[0]}"
         else:
             name = {"unregularized": "multiprs", "elasticnet": "elastic_net"}.get(model.variant, model.variant)
+
         name = args.method or name
         scores = pd.DataFrame({name: model.predict_prs(data)})
 
@@ -376,6 +407,7 @@ def main():
 
             scores[f"anchor_only_mb{args.window_mb}"] = anchor_scores(model, data)
     elif args.raw_sources:
+        logging.info("Reading raw genome-wide PRSs: N=%s", data.n_samples)
         family = args.family
 
         if data.window_names != ("genomewide",):
@@ -386,6 +418,10 @@ def main():
                               columns=[f"single:{source}" for source in data.source_names])
     else:
         family = args.family
+
+        logging.info("Aligning external genetic scores: N=%s", data.n_samples)
+
+        # Aligns every external score table by ID before combining method columns.
         frames = [load_scores(path, data.sample_ids, args.score_columns, data.y) for path in args.scores]
         scores = pd.concat(frames, axis=1)
 
@@ -400,6 +436,7 @@ def main():
 
         data = SimpleNamespace(y=data.y, sample_ids=data.sample_ids, n_samples=data.n_samples,
                                covariates=np.column_stack((data.covariates, extra.to_numpy(dtype=float))))
+
         if args.covariate_set == "standard":
             args.covariate_set = "expanded"
 
@@ -415,7 +452,10 @@ def main():
     if len(args.groups) != len(set(args.groups)) or len(args.metrics) != len(set(args.metrics)):
         parser.error("Groups and metrics must not be repeated.")
 
+    # Evaluates the requested groups and attaches analysis labels to both output tables.
     labels = score_labels(scores.columns, args.window_mb)
+    logging.info("Evaluating %s scores; groups=%s; metrics=%s",
+                 len(scores.columns), ", ".join(args.groups), ", ".join(args.metrics))
     results, comparisons = evaluate_groups(data, participants, scores, family, args.groups, args.split,
                                            args.metrics, args.bootstrap, args.seed, args.reference)
     context = dict(phenotype=args.phenotype, cohort=args.cohort, train_group=args.train_group,
@@ -424,6 +464,7 @@ def main():
     results = label_results(results, labels, context)
     comparisons = label_results(comparisons, labels, context)
 
+    # Saves point estimates and, when requested, paired comparisons and predictions.
     args.output.parent.mkdir(parents=True, exist_ok=True)
     results.to_csv(args.output, sep="\t", index=False, na_rep="NA")
 
@@ -441,6 +482,7 @@ def main():
     display = ["group", "method", "metric", "value", "n", "status"]
     display += [name for name in ("bootstrap_se", "difference", "difference_se") if name in results]
     print(results[display].to_string(index=False, na_rep="NA"))
+    logging.info("Saved evaluation: %s; elapsed=%.1fs", args.output, monotonic() - started)
 
 
 if __name__ == "__main__":

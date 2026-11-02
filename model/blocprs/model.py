@@ -49,7 +49,7 @@ class BLocPRS:
     Fitted models keep coefficients, training means and SDs, not training data.
     """
 
-    # Set the phenotype family, penalty choices and fitting options.
+    # Sets the phenotype family, penalty choices and fitting options.
     def __init__(self, family="gaussian", *, lambda_=None, lambda_grid=None,
                  cv_folds=5, cv_max_samples=50000, random_state=42, block_size=8192,
                  cv_workers=1, fit_workers=1, cache_dir=None):
@@ -64,7 +64,7 @@ class BLocPRS:
         self.fit_workers = _positive_integer(fit_workers, "fit_workers")
         self.cache_dir = None if cache_dir is None else str(cache_dir)
 
-    # Select the penalty and fit using training participants only.
+    # Selects the penalty and fits using training participants only.
     def fit(self, data):
         if not isinstance(data, PRSData) or data.y is None:
             raise ValueError("fit requires PRSData with an outcome vector.")
@@ -72,8 +72,8 @@ class BLocPRS:
         if self.lambda_ is not None:
             if not np.isfinite(self.lambda_) or self.lambda_ < 0:
                 raise ValueError("lambda_ must be finite and nonnegative.")
-            if self.lambda_grid is not None:
-                raise ValueError("Choose a fixed lambda_ or a lambda_grid, not both.")
+
+            assert self.lambda_grid is None
 
         grid = (np.logspace(-3, 3, 25) if self.lambda_grid is None
                 else np.asarray(self.lambda_grid, dtype=float))
@@ -89,15 +89,17 @@ class BLocPRS:
         else:
             selected_lambda, cv_results = float(self.lambda_), []
 
-        # Refit scaling and coefficients on all training rows after selection.
+        # Refits scaling and coefficients on all training rows after selection.
         logger.info("Full training refit: N=%s, lambda=%g", data.n_samples, selected_lambda)
         scaler = Scaler.fit(data, self.family, self.block_size)
         design = Design(data, scaler, block_size=self.block_size)
         n_unpenalized = 1 + design.n_covariates + len(data.source_names)
+
         if self.family == "binomial":
 
-            # CV caches have already been removed; keep only the final transformed design.
+            # Caches only the final transformed design; CV caches have already been removed.
             required_bytes = design.n_samples * (design.n_features + 1) * 8
+
             with workspace(self.cache_dir, required_bytes) as directory:
                 with cached_design(design, directory, "full_train") as cached:
                     with threadpool_limits(limits=1):
@@ -107,7 +109,7 @@ class BLocPRS:
             with threadpool_limits(limits=self.fit_workers):
                 result = solve(design, self.family, selected_lambda, n_unpenalized)
 
-        # Retain fitted parameters and summaries, not the training arrays.
+        # Retains fitted parameters and summaries, not the training arrays.
         self.scaler_ = scaler
         self.source_names_ = tuple(data.source_names)
         self.window_names_ = tuple(data.window_names)
@@ -128,39 +130,40 @@ class BLocPRS:
 
         return self
 
-    # Stop if coefficients have not been fitted or loaded.
+    # Stops if coefficients have not been fitted or loaded.
     def _require_fitted(self):
         if not hasattr(self, "coef_"):
             raise ValueError("Fit or load a BLocPRS model before using it.")
 
-    # Return alpha_0, the fitted intercept.
+    # Returns alpha_0, the fitted intercept.
     @property
     def alpha_0_(self):
         self._require_fitted()
         return float(self.coef_[0])
 
-    # Return alpha, the coefficients of the transformed covariates.
+    # Returns alpha, the coefficients of the transformed covariates.
     @property
     def alpha_(self):
         self._require_fitted()
         return self.coef_[1 : 1 + len(self.covariate_names_)].copy()
 
-    # Return gamma, one global coefficient per source.
+    # Returns gamma, one global coefficient per source.
     @property
     def gamma_(self):
         self._require_fitted()
         start = 1 + len(self.covariate_names_)
         return self.coef_[start : start + len(self.source_names_)].copy()
 
-    # Return eta, the regional coefficients in W x K order.
+    # Returns eta, the regional coefficients in W x K order.
     @property
     def eta_(self):
         self._require_fitted()
         start = 1 + len(self.covariate_names_) + len(self.source_names_)
         shape = (len(self.window_names_), len(self.source_names_))
+
         return self.coef_[start:].reshape(shape).copy()
 
-    # Center eta by removing each source's mean regional coefficient.
+    # Centers eta by removing each source's mean regional coefficient.
     @property
     def eta_centered_(self):
         eta = self.eta_
@@ -168,12 +171,12 @@ class BLocPRS:
         # Centering coefficients here is equivalent to using the centered window design Z.
         return eta - eta.mean(axis=0, keepdims=True)
 
-    # Return c_eff = gamma + eta_centered in window/source order.
+    # Returns c_eff = gamma + eta_centered in window/source order.
     @property
     def c_eff_(self):
         return self.gamma_[None, :] + self.eta_centered_
 
-    # Compute genetic-only or full predictions in participant blocks.
+    # Computes genetic-only or full predictions in participant blocks.
     def _predict(self, data, *, genetic_only):
         self._require_fitted()
 
@@ -190,7 +193,7 @@ class BLocPRS:
                 stop = min(start + self.block_size, data.n_samples)
                 S_window = self.scaler_.transform_windows(data.window_scores[start:stop])
 
-                # Sum windows and sources, keeping one value per participant.
+                # Sums windows and sources, keeping one value per participant.
                 values[start:stop] = np.einsum("iwk,wk->i", S_window, c_eff, dtype=np.float64)
 
             if not np.isfinite(values).all():
@@ -213,22 +216,21 @@ class BLocPRS:
 
         return values
 
-    # Compute the genetic score without covariates, intercept or sigmoid.
+    # Computes the genetic score without covariates, intercept or sigmoid.
     def predict_prs(self, data):
         return self._predict(data, genetic_only=True)
 
-    # Compute full ell: intercept + covariates + genetics, in model units.
+    # Computes full ell: intercept + covariates + genetics, in model units.
     def predict_linear(self, data):
         return self._predict(data, genetic_only=False)
 
-    # Convert the full binary predictor to P(y=1) for each participant.
+    # Converts the full binary predictor to P(y=1) for each participant.
     def predict_proba(self, data):
-        if self.family != "binomial":
-            raise ValueError("predict_proba requires a binomial model.")
+        assert self.family == "binomial"
 
         return expit(self.predict_linear(data))
 
-    # Evaluate covariate-adjusted R^2; only the evaluation regressions are refitted.
+    # Evaluates covariate-adjusted R^2; only the evaluation regressions are refitted.
     def score(self, data):
         self._require_fitted()
 
@@ -238,11 +240,12 @@ class BLocPRS:
         if data.covariate_names != self.covariate_names_:
             raise ValueError("Evaluation requires the fitted covariate names and order.")
 
-        # Evaluate the frozen genetic score using the shared CV metric.
+        # Evaluates the frozen genetic score using the shared CV metric.
         metric = NagelkerkeR2 if self.family == "binomial" else IncrementalR2
+
         return metric(data.y, data.covariates).score(self.predict_prs(data))
 
-    # Save coefficients, training means/SDs and settings in one NumPy archive.
+    # Saves coefficients, training means/SDs and settings in one NumPy archive.
     def save(self, path):
         self._require_fitted()
         path = Path(path)
@@ -274,13 +277,13 @@ class BLocPRS:
         }
         scaler = self.scaler_
 
-        # Replace the destination only after the archive has been written.
+        # Replaces the destination only after the temporary archive is fully written.
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 
         try:
             with os.fdopen(fd, "wb") as stream:
 
-                # Keep v1 archive keys unchanged; only the in-code field names differ.
+                # The v1 archive keys remain unchanged; only the in-code field names differ.
                 np.savez_compressed(stream, metadata=np.asarray(json.dumps(metadata, allow_nan=False)),
                                     coef=self.coef_, window_mean=scaler.window_mean,
                                     source_scale=scaler.source_sd,
@@ -292,7 +295,7 @@ class BLocPRS:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    # Restore a fitted model and its saved training parameters.
+    # Restores a fitted model and its saved training parameters.
     @classmethod
     def load(cls, path):
         with np.load(path, allow_pickle=False) as saved:
@@ -311,7 +314,7 @@ class BLocPRS:
             if cv_scaling_scope not in ("fold_training", "outer_training", "not_run"):
                 raise ValueError("Unsupported CV scaling scope.")
 
-            # Translate v1 archive keys to the explicit mean/SD field names.
+            # Translates v1 archive keys to the explicit mean/SD field names.
             archive_names = {
                 "window_mean": "window_mean",
                 "source_scale": "source_sd",
@@ -321,8 +324,9 @@ class BLocPRS:
                 "outcome_scale": "y_sd",
             }
 
-            # Reject nonnumeric arrays before Scaler performs any conversion.
+            # Rejects nonnumeric arrays before Scaler performs any conversion.
             arrays = {}
+
             for stored_name, name in archive_names.items():
                 value = saved[stored_name].copy()
 
@@ -331,7 +335,7 @@ class BLocPRS:
 
                 arrays[name] = value
 
-            # Check the restored source/window/covariate order, means and SDs.
+            # Checks the restored source/window/covariate order, means and SDs.
             scaler = Scaler(family=metadata["family"], source_names=metadata["source_names"],
                             window_names=metadata["window_names"], covariate_names=metadata["covariate_names"],
                             **arrays)

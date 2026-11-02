@@ -17,7 +17,7 @@ phenotypes = {
 }
 
 
-# Read the dedicated analysis, not figure exports or raw SNP-level GWAS files.
+# Concentration inputs come from dedicated analyses, not figure exports or raw SNP-level GWAS files.
 def load_results(data_root, analysis_dir=None):
     names = {"LDL_MA": "LDL", "ASTHMA_MA": "ASTHMA", "LOG_CRTN_SEX": "LOG_CRTN", "HEIGHT_MA": "HEIGHT"}
     data = pd.concat([pd.read_csv(analysis_dir / name / "gwas/concentration.tsv", sep="\t")
@@ -26,15 +26,19 @@ def load_results(data_root, analysis_dir=None):
     if not data.window_size.eq("mb1").all():
         raise ValueError("The GWAS concentration figure requires 1-Mb windows.")
 
+    # Input validation matches four phenotype labels and prespecified selected fractions.
     data["phenotype"] = data.phenotype.map(names)
     expected = {(phenotype, fraction) for phenotype in phenotypes for fraction in fractions}
 
     if data.duplicated(["phenotype", "fraction"]).any() or set(zip(data.phenotype, data.fraction)) != expected:
         raise ValueError("Incomplete or duplicate GWAS concentration results")
+
     if not np.isfinite(data.concentration_ratio).all() or (data.concentration_ratio < 0).any():
         raise ValueError("Invalid GWAS concentration ratios")
+
     if not data.cap.eq(50).all():
         raise ValueError("Expected the prespecified cap of 50 for window GWAS scores")
+
     if not np.allclose(data.concentration_ratio, data.signal_share / data.window_share):
         raise ValueError("Concentration must equal signal share divided by window share")
 
@@ -45,6 +49,7 @@ def load_results(data_root, analysis_dir=None):
 def build_figure(data):
     fig, ax = plt.subplots(figsize=(183 / 25.4, 95 / 25.4))
     fig.subplots_adjust(left=.095, right=.98, bottom=.17, top=.89)
+
     for phenotype, (label, color, marker, size) in phenotypes.items():
         frame = data.loc[data.phenotype.eq(phenotype)].sort_values("fraction")
         ax.plot(range(len(fractions)), frame.concentration_ratio, color=color,
@@ -62,13 +67,16 @@ def build_figure(data):
     ax.tick_params(axis="both", labelsize=6.8)
     fig.legend(*ax.get_legend_handles_labels(), loc="upper center", bbox_to_anchor=(.545, .995),
                ncol=4, frameon=False, fontsize=7, handlelength=1.8, handletextpad=.5, columnspacing=1.4)
+
     return fig
 
 
-# Export the four-trait concentration comparison.
+# The command exports the four-trait concentration comparison.
 def main():
     args = parse_args(__doc__, supplementary=True, interpretation=True)
+
     data = load_results(args.data_root, args.analysis_dir)
+
     with plt.rc_context(style):
         save_figure(build_figure(data), args.output_dir / "suppl_gwas_concentration.pdf")
 

@@ -22,7 +22,7 @@ class NonEstimableError(ValueError):
     """The evaluation data are valid, but the metric cannot be estimated."""
 
 
-# Check and copy evaluation phenotypes and covariates in the supplied row order.
+# Checks and copies evaluation phenotypes and covariates in the supplied row order.
 def _inputs(y, covariates):
     y = np.asarray(y, dtype=np.float64)
 
@@ -41,7 +41,7 @@ def _inputs(y, covariates):
     return y.copy(), covariates.copy()
 
 
-# Standardize the frozen score for the unpenalized evaluation regression.
+# Standardizes the frozen score for the unpenalized evaluation regression.
 def _standardized_score(genetic_score, y):
     score = np.asarray(genetic_score, dtype=np.float64)
 
@@ -52,7 +52,7 @@ def _standardized_score(genetic_score, y):
     if np.all(score == score[0]):
         return np.zeros_like(score)
 
-    # Rescale only this auxiliary regression's input for numerical stability.
+    # Rescales only this auxiliary regression's input for numerical stability.
     # With a free intercept and score coefficient, its fitted values are unchanged in exact arithmetic.
     score = score - score.mean()
     score_sd = score.std(ddof=0)
@@ -69,7 +69,7 @@ class IncrementalR2:
     Both models use the same participants and total phenotype variance.
     """
 
-    # Fit the covariate-only OLS model and retain its residual sum of squares.
+    # Fits the covariate-only OLS model and retains its residual sum of squares.
     def __init__(self, y, covariates=None):
         self.y, covariates = _inputs(y, covariates)
         centered = self.y - self.y.mean()
@@ -83,7 +83,7 @@ class IncrementalR2:
         residual = self.y - self.null_design @ coef
         self.null_ss = float(residual @ residual)
 
-    # Refit OLS with the frozen score and return its incremental R^2.
+    # Refits OLS with the frozen score and returns its incremental R^2.
     def score(self, genetic_score):
         score = _standardized_score(genetic_score, self.y)
 
@@ -95,7 +95,7 @@ class IncrementalR2:
         coef = np.linalg.lstsq(full_design, self.y, rcond=None)[0]
         residual = self.y - full_design @ coef
 
-        # Divide the reduction in squared error by total phenotype variation.
+        # Divides the reduction in squared error by total phenotype variation.
         value = float((self.null_ss - residual @ residual) / self.total_ss)
 
         if not np.isfinite(value):
@@ -110,7 +110,7 @@ class NagelkerkeR2:
     Both models use the same participants; normalization uses the covariate-only fit.
     """
 
-    # Fit the covariate-only logistic model and compute the normalization factor.
+    # Fits the covariate-only logistic model and computes the normalization factor.
     def __init__(self, y, covariates=None):
         self.y, covariates = _inputs(y, covariates)
         classes = np.unique(self.y)
@@ -123,7 +123,7 @@ class NagelkerkeR2:
 
         self.covariates = pd.DataFrame(covariates)
 
-        # Remove constant covariates before fitting either logistic model.
+        # Removes constant covariates before fitting either logistic model.
         self.covariates = self.covariates.loc[:, self.covariates.var(axis=0) > 0]
         self.null_ll = self._fit_log_likelihood(self.covariates, "covariate-only")
 
@@ -132,7 +132,7 @@ class NagelkerkeR2:
         if not np.isfinite(self.denominator) or self.denominator <= 0:
             raise NonEstimableError("Nagelkerke normalization is not estimable.")
 
-    # Return the logistic log-likelihood only when the fit converges and is finite.
+    # Returns the logistic log-likelihood only when the fit converges and is finite.
     def _fit_log_likelihood(self, covariates, label):
         try:
 
@@ -148,7 +148,7 @@ class NagelkerkeR2:
 
         return float(result.llf)
 
-    # Refit logistic regression with the frozen score and return Nagelkerke R^2.
+    # Refits logistic regression with the frozen score and returns Nagelkerke R^2.
     def score(self, genetic_score):
         score = _standardized_score(genetic_score, self.y)
 
@@ -166,11 +166,11 @@ class NagelkerkeR2:
         return float(value)
 
 
-# Evaluate the fixed PRS using OLS regressions fitted on these participants.
+# Evaluates the fixed PRS using OLS regressions fitted on these participants.
 def incremental_r2(y, genetic_score, covariates=None):
     return IncrementalR2(y, covariates).score(genetic_score)
 
 
-# Evaluate the fixed PRS using logistic regressions fitted on these participants.
+# Evaluates the fixed PRS using logistic regressions fitted on these participants.
 def nagelkerke_r2(y, genetic_score, covariates=None):
     return NagelkerkeR2(y, covariates).score(genetic_score)

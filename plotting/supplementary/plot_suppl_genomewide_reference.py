@@ -18,10 +18,13 @@ missing_cag = {"LOG_TST_SEX", "DEM_MT"}
 
 def load_results(data_root, analysis_dir=None):
     tables = []
+
     for phenotype, family in core_phenotypes:
         for scenario in scenarios:
             if scenario == scenarios[1] and phenotype in missing_cag:
                 continue
+
+            # Saved reference evaluations compare MultiPRS with the frozen genome-wide component.
             path = analysis_dir / phenotype / "ablation" / scenario / "reference.tsv"
             frame = pd.read_csv(path, sep="\t")
 
@@ -30,21 +33,22 @@ def load_results(data_root, analysis_dir=None):
                     or not frame.scenario.eq(scenario).all() or not frame.window_size.eq("mb1").all()):
                 raise ValueError(f"Incomplete or mismatched genome-wide-component comparison: {path}")
 
-            values = frame[["value", "n", "bootstrap_se"]].to_numpy(dtype=float)
-            if (not np.isfinite(values).all() or frame.n.nunique() != 1
-                    or (frame.n <= 0).any() or frame.bootstrap_se.lt(0).any()):
+            if (not np.isfinite(frame[["value", "n", "bootstrap_se"]].to_numpy(dtype=float)).all()
+                    or frame.n.nunique() != 1 or (frame.n <= 0).any() or frame.bootstrap_se.lt(0).any()):
                 raise ValueError(f"Matched estimates and bootstrap SEs are required: {path}")
 
             tables.append(frame)
-    return pd.concat(tables, ignore_index=True)
 
+    return pd.concat(tables, ignore_index=True)
 
 
 def build_figure(data):
     width, height = 183, 185
     fig = plt.figure(figsize=(width/25.4, height/25.4))
+
     for col, title in enumerate(["Held-out UK Biobank", r"UK Biobank $\rightarrow$ CARTaGENE transfer"]):
         fig.text((25+88*col+32)/width, 177/height, title, ha="center", va="center", fontsize=7.5)
+
     for row, family in enumerate(["continuous", "binary"]):
         selected_family = data.loc[data.family.eq(family)]
 
@@ -56,20 +60,26 @@ def build_figure(data):
         ticks = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]).tick_values(lower, upper)
         ticks = ticks[(ticks >= lower) & (ticks <= upper)]
         bottom, panel_height = (105, 63) if row == 0 else (24, 60)
+
         for col, scenario in enumerate(scenarios):
             ax = fig.add_axes([(25+88*col)/width, bottom/height, 64/width, panel_height/height])
             selected = selected_family.loc[selected_family.scenario.eq(scenario)]
+
             for index in range(0, len(order), 2):
                 ax.axhspan(index-.49, index+.49, color="#F2F3F4", linewidth=0, zorder=0)
+
             for j, (method, color, marker) in enumerate(zip(methods, colors, ["s", "o"])):
                 values = selected.loc[selected.method.eq(method)].set_index("phenotype").reindex(order)
                 ax.errorbar(values.value, np.arange(len(order))+(j-.5)*.30, xerr=values.bootstrap_se,
                             fmt=marker, linestyle="none", markersize=2.8, markerfacecolor=color,
                             markeredgecolor=color, markeredgewidth=.5, ecolor=color,
                             elinewidth=.55, capsize=0, zorder=3)
+
+            # Unavailable transfer traits remain visible as missing entries.
             for index, phenotype in enumerate(order):
                 if phenotype not in set(selected.phenotype):
                     ax.text(upper*.045, index, "-", fontsize=9, va="center", color="#777777")
+
             ax.set(ylim=(len(order)-.5, -.5), xlim=(lower, upper), xticks=ticks)
             ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: "0" if value == 0 else f"{value:.2f}"))
             ax.set_yticks(range(len(order)), [phenotype_label(p) for p in order], fontsize=6)
@@ -80,17 +90,21 @@ def build_figure(data):
                     fontweight="bold", va="bottom")
             ax.text(.5, 1.045, family.capitalize(), transform=ax.transAxes,
                     ha="center", va="bottom", fontsize=7)
+
     handles = [Line2D([], [], linestyle="none", marker=marker, color=color,
                       markerfacecolor=color, markeredgewidth=.5, markersize=3.5)
                for color, marker in zip(colors, ["s", "o"])]
     fig.legend(handles, methods, loc="lower center", bbox_to_anchor=(.5, .025), ncol=2,
                fontsize=7, frameon=False, handlelength=1, columnspacing=2.4)
+
     return fig
 
 
 def main():
     args = parse_args(__doc__, supplementary=True, interpretation=True)
+
     data = load_results(args.data_root, args.analysis_dir)
+
     with plt.rc_context(style):
         save_figure(build_figure(data), args.output_dir / "suppl_genomewide_reference.pdf")
 

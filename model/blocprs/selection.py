@@ -6,25 +6,25 @@ import numpy as np
 import pandas as pd
 
 
-# Read one- or two-column ID files, with an optional header.
+# Reads one- or two-column ID files, with an optional header.
 def read_ids(path):
     table = pd.read_csv(path, sep=r"\s+", header=None, dtype=str, keep_default_na=False)
 
     if table.shape[1] not in (1, 2):
         raise ValueError("ID files need one IID column or two FID/IID columns.")
 
-    header = tuple(value.lstrip("#").upper() for value in table.iloc[0])
-    if header in (("IID",), ("ID",), ("FID", "IID")):
+    if tuple(value.lstrip("#").upper() for value in table.iloc[0]) in (("IID",), ("ID",), ("FID", "IID")):
         table = table.iloc[1:]
 
     if table.empty or table.isna().any().any() or table.eq("").any().any() or table.duplicated().any():
         raise ValueError(f"Empty, missing or duplicate participant IDs: {path}")
 
     table.columns = ["IID"] if table.shape[1] == 1 else ["FID", "IID"]
+
     return table.reset_index(drop=True)
 
 
-# Match IDs within the supplied population, retaining the ID-file order.
+# Matches IDs within the supplied population, retaining the ID-file order.
 def id_positions(participants, ids_file):
     ids = read_ids(ids_file)
     columns = ids.columns.tolist()
@@ -42,7 +42,7 @@ def id_positions(participants, ids_file):
     return rows
 
 
-# Read participant metadata and the small covariate array, without reading PRSs.
+# Reads participant metadata and the small covariate array, without reading PRSs.
 def read_participants(path, split=None):
     path = Path(path)
     table = pd.read_csv(path / "participants.tsv", sep="\t", dtype={"FID": str, "IID": str},
@@ -60,7 +60,7 @@ def read_participants(path, split=None):
 
     for index, name in enumerate(names):
 
-        # Do not silently replace a saved metadata field with a covariate.
+        # Rejects covariates that conflict with saved metadata before assignment.
         if name in table and not np.array_equal(table[name].to_numpy(), covariates[:, index]):
             raise ValueError(f"Saved participant metadata and covariates disagree for {name}.")
 
@@ -69,17 +69,23 @@ def read_participants(path, split=None):
     return table if split is None else table.loc[table["split"].eq(split)].copy()
 
 
-# Filter recorded values; non-EUR means every recorded ancestry except EUR.
+# Filters recorded values; non-EUR means every recorded ancestry except EUR.
 def filter_participants(table, ancestry=None, sex=None, filters=None):
     keep = np.ones(len(table), dtype=bool)
+
+    # Applies the requested ancestry group first.
     if ancestry:
         values = [ancestry] if isinstance(ancestry, str) else ancestry
         ancestry_keep = table["Ancestry"].isin(values).to_numpy()
+
         if "non-EUR" in values:
             ancestry_keep |= table["Ancestry"].notna().to_numpy() & table["Ancestry"].ne("EUR").to_numpy()
+
         keep &= ancestry_keep
 
+    # Combines sex and other metadata filters with the ancestry selection.
     selections = [] if filters is None else list(filters)
+
     if sex is not None:
         selections.append(("Sex", [sex] if isinstance(sex, (str, int, float)) else sex))
 
@@ -87,8 +93,10 @@ def filter_participants(table, ancestry=None, sex=None, filters=None):
         name, values = selection.split("=", 1) if isinstance(selection, str) else selection
         values = [values] if isinstance(values, str) else list(values)
         column = table[name]
+
         if pd.api.types.is_numeric_dtype(column):
             values = [float(value) for value in values]
+
         keep &= column.isin(values).to_numpy()
 
     result = table.loc[keep].copy()
@@ -99,12 +107,14 @@ def filter_participants(table, ancestry=None, sex=None, filters=None):
     return result
 
 
-# Form joint strata, including binary phenotype classes unless disabled.
+# Forms joint strata, including binary phenotype classes unless disabled.
 def stratum_labels(table, columns=None, binary_default=True):
     columns = [] if columns is None else list(columns)
     binary = set(table["phenotype"].dropna().unique()) == {0, 1}
+
     if binary_default and binary and "phenotype" not in columns:
         columns.insert(0, "phenotype")
+
     if not columns:
         return None
 
@@ -116,7 +126,7 @@ def stratum_labels(table, columns=None, binary_default=True):
     return pd.factorize(pd.MultiIndex.from_frame(values), sort=True)[0]
 
 
-# Draw exact-size subsets; nested subsets are prefixes of one stratified order.
+# Draws exact-size subsets; nested subsets are prefixes of one stratified order.
 def sample_subsets(n_samples, sizes, labels=None, nested=False, seed=42):
     sizes = np.asarray(sizes)
 
@@ -130,23 +140,27 @@ def sample_subsets(n_samples, sizes, labels=None, nested=False, seed=42):
         if labels.shape != (n_samples,):
             raise ValueError("Strata must describe the full sampling population.")
 
+    # Uses the same strata for either nested or independently sampled subsets.
     sizes = sizes.tolist()
     rng = np.random.default_rng(seed)
     groups = ([np.arange(n_samples)] if labels is None else
               [np.flatnonzero(labels == label) for label in np.unique(labels)])
     counts = np.array([len(group) for group in groups])
+
     if nested:
 
-        # Interleave shuffled strata in proportion to their population sizes.
+        # Interleaves shuffled strata in proportion to their population sizes.
         shuffled = [rng.permutation(group) for group in groups]
 
         # Midpoint ranks put each stratum on the same 0-to-1 scale.
         # Taking prefixes of the combined order makes all requested subsets nested.
         priorities = np.concatenate([(np.arange(count) + 0.5) / count for count in counts])
         order = np.concatenate(shuffled)[np.argsort(priorities, kind="stable")]
+
         return {size: order[:size].copy() for size in sizes}
 
     subsets = {}
+
     for size in sizes:
 
         # Largest remainders preserve proportions while giving the exact total.
@@ -157,4 +171,5 @@ def sample_subsets(n_samples, sizes, labels=None, nested=False, seed=42):
         selected = np.concatenate([rng.choice(group, count, replace=False)
                                    for group, count in zip(groups, allocated)])
         subsets[size] = rng.permutation(selected)
+
     return subsets

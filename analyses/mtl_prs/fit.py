@@ -1,6 +1,8 @@
 """Baseline calibration and individual-level MTL-PRS coordinate paths."""
 
 from pathlib import Path
+import logging
+from time import monotonic
 
 import numpy as np
 import pandas as pd
@@ -16,7 +18,7 @@ DEFAULT_FACTORS = (1.0, 10.0, 100.0, 1000.0)
 DEFAULT_ITERATIONS = 15
 
 
-# Fit standardized y on a centered raw mixture and standardized covariates.
+# Baseline calibration regresses standardized y on a centered raw mixture and standardized covariates.
 def calibrate_baseline(y, covariates, scores, pi):
     y, covariates = np.asarray(y, dtype=float), np.asarray(covariates, dtype=float)
     scores, pi = np.asarray(scores, dtype=float), np.asarray(pi, dtype=float)
@@ -29,6 +31,7 @@ def calibrate_baseline(y, covariates, scores, pi):
     if not all(np.isfinite(a).all() for a in (y, covariates, scores, pi)):
         raise ValueError("Calibration inputs must be finite")
 
+    # Scaling estimates come from the update-training participants.
     y_mean, y_sd = float(y.mean()), float(y.std(ddof=1))
     covariate_mean = covariates.mean(axis=0)
     covariate_sd = covariates.std(axis=0, ddof=1)
@@ -40,11 +43,14 @@ def calibrate_baseline(y, covariates, scores, pi):
     covariates_standardized = (covariates - covariate_mean) / covariate_sd
     initial_score = scores @ pi
     initial_score -= initial_score.mean()
+
+    # Joint OLS estimates the mixture slope and unpenalized covariate effects.
     design = np.column_stack([np.ones(len(y)), initial_score, covariates_standardized])
     coefficients = np.linalg.lstsq(design, y_standardized, rcond=None)[0]
 
-    # Remove fitted covariate effects, but retain the genetic signal for SNP updates.
+    # The residual excludes fitted covariate effects but retains the genetic signal for SNP updates.
     residual = y_standardized - coefficients[0] - covariates_standardized @ coefficients[2:]
+
     return {
         "residual": residual,
         "theta": float(coefficients[1]),
@@ -57,7 +63,7 @@ def calibrate_baseline(y, covariates, scores, pi):
     }
 
 
-# Label the baseline and each sweep, keeping factor-major candidate order.
+# Candidate labels identify the baseline and each sweep in factor-major order.
 def candidate_labels(factors=DEFAULT_FACTORS, iterations=DEFAULT_ITERATIONS):
     return np.asarray(["baseline"] + [
         f"factor_{factor:g}.iter_{iteration:02d}"
@@ -65,24 +71,29 @@ def candidate_labels(factors=DEFAULT_FACTORS, iterations=DEFAULT_ITERATIONS):
     ])
 
 
-# Restart each learning-rate path and update the residual after every coordinate.
+# Each learning-rate path restarts from the baseline and updates the residual after every coordinate.
 def _coordinate_kernel(beta_initial, gram, gy, total_variants, factors, iterations):
     output = np.empty((len(beta_initial), 1 + len(factors) * iterations), dtype=np.float64)
     output[:, 0] = beta_initial
     candidate = 1
+
     for factor in factors:
         alpha = min(float(factor) / total_variants, 1.0)
         beta = beta_initial.copy()
         residual_gradient = gy - gram @ beta
+
         for _ in range(iterations):
             for variant in range(len(beta)):
                 delta = alpha * residual_gradient[variant]
                 beta[variant] += delta
 
-                # Update all residual correlations without re-reading participant genotypes.
+                # The Gram-matrix update adjusts all residual correlations without re-reading participant genotypes.
                 residual_gradient -= gram[:, variant] * delta
+
+            # Each complete SNP sweep contributes one candidate.
             output[:, candidate] = beta
             candidate += 1
+
     return output
 
 
@@ -107,7 +118,7 @@ def coordinate_update_candidates(beta_initial, gram, gy, total_variants,
     return _coordinate_kernel(beta_initial, gram, gy, int(total_variants), factors, int(iterations))
 
 
-# Match upstream end-defined (previous_end, end] bins, including the final tail.
+# Block assignments match upstream end-defined (previous_end, end] bins, including the final tail.
 def _block_indices(path, chromosome, positions):
     if str(path).lower() in {"single", "single-block", "none"} or not len(positions):
         return np.zeros(len(positions), dtype=np.int64)
@@ -127,16 +138,18 @@ def _block_indices(path, chromosome, positions):
     return np.searchsorted(ends, positions, side="left").astype(np.int64)
 
 
-# Mean-impute missing dosages before taking SD with the full training n - 1.
+# Dosage SDs reflect mean imputation and use the full training n - 1 denominator.
 def _variant_statistics(reader, variants, samples, sample_batch_size):
     sums = np.zeros(len(variants), dtype=float)
     squares = np.zeros(len(variants), dtype=float)
     counts = np.zeros(len(variants), dtype=np.int64)
+
     for start in range(0, len(samples), sample_batch_size):
         genotype = reader.read(variants, samples[start:start + sample_batch_size]).astype(float)
         sums += np.nansum(genotype, axis=0)
         squares += np.nansum(genotype * genotype, axis=0)
         counts += np.isfinite(genotype).sum(axis=0)
+
     means = np.divide(sums, counts, out=np.full(len(variants), np.nan), where=counts > 0)
     centered_ss = squares - np.divide(
         sums * sums, counts, out=np.zeros(len(variants)), where=counts > 0)
@@ -144,13 +157,15 @@ def _variant_statistics(reader, variants, samples, sample_batch_size):
     # Mean-imputed entries add zero centered SS but remain in the sample-size denominator.
     variance = np.divide(
         centered_ss, len(samples) - 1, out=np.full(len(variants), np.nan), where=counts > 0)
+
     return means, np.sqrt(np.maximum(variance, 0.0))
 
 
-# Accumulate one LD block's standardized Gram matrix without loading all samples.
+# Batched accumulation computes one LD block's standardized Gram matrix without loading all samples.
 def _sufficient_statistics(reader, variants, samples, residual, means, sds, sample_batch_size):
     gram = np.zeros((len(variants), len(variants)), dtype=float)
     gy = np.zeros(len(variants), dtype=float)
+
     for start in range(0, len(samples), sample_batch_size):
         stop = min(start + sample_batch_size, len(samples))
         genotype = reader.read(variants, samples[start:stop]).astype(float)
@@ -160,19 +175,22 @@ def _sufficient_statistics(reader, variants, samples, residual, means, sds, samp
         standardized[~np.isfinite(standardized)] = 0.0
         gram += standardized.T @ standardized
         gy += standardized.T @ residual[start:stop]
+
     return gram / (len(samples) - 1), gy / (len(samples) - 1)
 
 
-# Verify variant identities before using saved indices, then fit independent LD blocks.
+# Chromosome fitting verifies variant identities before using saved indices and fits independent LD blocks.
 def fit_chromosome(genotype_prefix, weights_path, ids, calibration, total_variants,
                    ld_blocks, chromosome, output, sample_batch_size=4096):
     chromosome = str(chromosome).removeprefix("chr")
     ids = np.asarray(ids, dtype=str)
     residual = np.asarray(calibration["residual"], dtype=float)
     theta = float(calibration["theta"])
+
+    # The weight table supplies this chromosome's allele-aligned source mixture.
     weights = pd.read_csv(weights_path, sep="\t", dtype={
         "chromosome": str, "snp": str, "ref": str, "alt": str,
-        "position": np.int64, "variant_index": np.int64,
+        "position": np.int64, "variant_index": np.int64, "beta": float,
     }).sort_values("variant_index").reset_index(drop=True)
 
     if len(ids) < 2 or residual.shape != (len(ids),) or not np.isfinite(residual).all():
@@ -192,6 +210,7 @@ def fit_chromosome(genotype_prefix, weights_path, ids, calibration, total_varian
                "position": np.int64, "training_mean": float, "training_sd": float}
     parts = {name: [] for name in (*columns, "beta_raw")}
     dropped = 0
+
     with PgenDosages(genotype_prefix) as reader:
         samples = reader.sample_indices(ids)
         indices = weights["variant_index"].to_numpy(np.int64)
@@ -200,14 +219,17 @@ def fit_chromosome(genotype_prefix, weights_path, ids, calibration, total_varian
             raise ValueError("Saved weight indices are outside the PVAR range")
 
         identity = ["chromosome", "position", "snp", "ref", "alt"]
-        actual = reader.variants.iloc[indices][identity].to_numpy()
-        if not np.array_equal(actual, weights[identity].to_numpy()):
+        if not np.array_equal(reader.variants.iloc[indices][identity].to_numpy(), weights[identity].to_numpy()):
             raise ValueError("Saved weight indices do not match PVAR variant IDs and alleles")
 
         weights["block"] = _block_indices(ld_blocks, chromosome, weights["position"].to_numpy())
 
-        # Estimate LD from training genotypes within each block; omit cross-block correlations.
-        for _, block in weights.groupby("block", sort=True):
+        # LD estimates use training genotypes within each block and omit cross-block correlations.
+        blocks = weights.groupby("block", sort=True)
+        started = last_report = monotonic()
+        logging.getLogger(__name__).info("chr%s: fitting %s LD blocks", chromosome, len(blocks))
+
+        for number, (_, block) in enumerate(blocks, start=1):
             variants = block["variant_index"].to_numpy(np.int64)
             means, sds = _variant_statistics(reader, variants, samples, sample_batch_size)
             retained = np.isfinite(sds) & (sds > 0)
@@ -221,24 +243,35 @@ def fit_chromosome(genotype_prefix, weights_path, ids, calibration, total_varian
             gram, gy = _sufficient_statistics(
                 reader, variants, samples, residual, means, sds, sample_batch_size)
 
-            # Convert per-allele effects to calibrated, standardized-genotype coefficients.
+            # Genotype SDs and the calibration slope convert per-allele effects to standardized-genotype coefficients.
             beta_initial = block["beta"].to_numpy(float) * sds * theta
             beta = coordinate_update_candidates(beta_initial, gram, gy, total_variants)
+
             for name in ("snp", "ref", "alt", "variant_index", "position"):
                 parts[name].append(block[name].to_numpy(dtype=columns[name]))
+
             parts["training_mean"].append(means)
             parts["training_sd"].append(sds)
 
-            # Undo genotype scaling; effects remain on the calibrated phenotype scale.
+            # Division by genotype SDs restores per-allele effects on the calibrated phenotype scale.
             parts["beta_raw"].append(beta / sds[:, None])
 
+            now = monotonic()
+            if now - last_report >= 30 or number == len(blocks):
+                logging.getLogger(__name__).info("chr%s: processed %s/%s LD blocks; elapsed=%.1fs",
+                                                 chromosome, number, len(blocks), now - started)
+                last_report = now
+
+    # Concatenation joins the fitted blocks, retaining every candidate and its training moments.
     arrays = {name: np.concatenate(parts[name]) if parts[name] else np.empty(0, dtype=dtype)
               for name, dtype in columns.items()}
     arrays["beta_raw"] = (np.concatenate(parts["beta_raw"]) if parts["beta_raw"]
                           else np.empty((0, len(labels)), dtype=float))
+
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(output, chromosome=np.asarray(chromosome), candidate_labels=labels,
              train_fid=ids[:, 0], train_iid=ids[:, 1], **arrays)
+
     return {"chromosome": chromosome, "training_n": len(ids), "input_variants": len(weights),
             "fitted_variants": len(arrays["snp"]), "dropped_monomorphic": dropped}

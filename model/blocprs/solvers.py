@@ -48,7 +48,7 @@ class GaussianStatistics:
     y_squared_mean: float
 
 
-# Build the ridge penalty vector for regional coefficients only.
+# Builds the ridge penalty vector for regional coefficients only.
 def _penalty(design, lambda_, n_unpenalized):
     p = design.n_features
 
@@ -62,13 +62,14 @@ def _penalty(design, lambda_, n_unpenalized):
     if not np.isfinite(lambda_) or lambda_ < 0:
         raise ValueError("Regional penalty must be finite and nonnegative.")
 
-    # Leave the intercept, covariates, and global source effects unpenalized.
+    # Leaves the intercept, covariates, and global source effects unpenalized.
     penalty = np.zeros(p, dtype=np.float64)
     penalty[n_unpenalized:] = lambda_
+
     return penalty
 
 
-# Read training blocks and check phenotypes, dimensions, and participant counts.
+# Reads training blocks and checks phenotypes, dimensions, and participant counts.
 def _blocks(design):
     n, p = design.n_samples, design.n_features
     seen = 0
@@ -89,7 +90,7 @@ def _blocks(design):
         raise ValueError(f"Design yielded {seen} rows; expected {n}.")
 
 
-# Accumulate X.T @ X, X.T @ y and y.T @ y once, without a full n x p design.
+# Accumulates X.T @ X, X.T @ y and y.T @ y once, without a full n x p design.
 def continuous_statistics(design):
     n, p = design.n_samples, design.n_features
     gram = np.zeros((p, p), dtype=np.float64, order="F")
@@ -114,7 +115,7 @@ def continuous_statistics(design):
             logger.info("Gaussian cross-products: %s/%s participants", processed, n)
             next_progress = 25 * (100 * processed // n // 25 + 1)
 
-    # Mirror the accumulated lower triangle before solving the full system.
+    # Mirrors the accumulated lower triangle before solving the full system.
     for column in range(p):
         gram[column, column + 1:] = gram[column + 1:, column]
 
@@ -124,12 +125,13 @@ def continuous_statistics(design):
     if not np.isfinite(gram).all() or not np.isfinite(rhs).all() or not np.isfinite(y_squared):
         raise FloatingPointError("Nonfinite Gaussian cross-products.")
 
-    # These statistics are shared by the penalty path and must not be modified.
+    # The penalty path shares these read-only statistics.
     gram.flags.writeable = rhs.flags.writeable = False
+
     return GaussianStatistics(gram, rhs, n, id(design), y_squared / n)
 
 
-# Compute the full mean-loss objective and gradient, including ridge penalties.
+# Computes the full mean-loss objective and gradient, including ridge penalties.
 def _objective_gradient(design, coef, penalty, family):
     n = design.n_samples
     loss = 0.0
@@ -150,7 +152,7 @@ def _objective_gradient(design, coef, penalty, family):
             # expit is the sigmoid; predicted probabilities minus y give the loss gradient.
             gradient += X.T @ (expit(linear_predictor) - y)
 
-    # Average the data loss; add lambda / 2 * ||eta||^2 only once.
+    # Averages the data loss and adds lambda / 2 * ||eta||^2 only once.
     loss = loss / n + 0.5 * float(np.sum(penalty * coef * coef))
     gradient = gradient / n + penalty * coef
 
@@ -160,21 +162,22 @@ def _objective_gradient(design, coef, penalty, family):
     return float(loss), gradient
 
 
-# Compute one logistic block without modifying its shared, cached inputs.
+# Computes one logistic block without modifying its shared, cached inputs.
 def _binary_block(design, start, stop, coef):
     X, y = design.read_block(start, stop)
     linear_predictor = X @ coef
     loss = float(np.sum(np.logaddexp(0.0, linear_predictor) - y * linear_predictor))
     gradient = X.T @ (expit(linear_predictor) - y)
+
     return loss, gradient
 
 
-# Limit BLAS in newly created threads as well as in the parent thread.
+# Limits BLAS in newly created threads as well as in the parent thread.
 def _limit_worker_threads():
     threadpool_limits(limits=1)
 
 
-# Keep only one pending block per worker and reduce results in participant order.
+# Keeps only one pending block per worker and reduces results in participant order.
 def _parallel_binary_objective(design, coef, penalty, pool, workers):
     starts = iter(range(0, design.n_samples, design.block_size))
     pending = deque()
@@ -206,16 +209,14 @@ def _parallel_binary_objective(design, coef, penalty, pool, workers):
     return float(loss), gradient
 
 
-# Fit the penalized Gaussian or logistic model, including its intercept.
+# Fits the penalized Gaussian or logistic model, including its intercept.
 def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, workers=1):
-    if family not in ("gaussian", "binomial"):
-        raise ValueError("family must be 'gaussian' or 'binomial'.")
+    assert family in ("gaussian", "binomial")
 
     n, p = design.n_samples, design.n_features
     penalty = _penalty(design, lambda_, n_unpenalized)
 
-    if isinstance(workers, (bool, np.bool_)) or not isinstance(workers, (int, np.integer)) or workers < 1:
-        raise ValueError("workers must be a positive integer.")
+    assert not isinstance(workers, (bool, np.bool_)) and isinstance(workers, (int, np.integer)) and workers >= 1
 
     if family == "gaussian":
         if initial is not None:
@@ -228,7 +229,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
             or stats.rhs.shape != (p,)):
             raise ValueError("Gaussian statistics do not match the design.")
 
-        # Add regional ridge penalties to the normal-equation diagonal.
+        # Adds regional ridge penalties to the normal-equation diagonal.
         system = stats.gram.copy(order="F")
 
         # Every p + 1 entries in a flattened p x p matrix selects its diagonal.
@@ -237,11 +238,11 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
 
         try:
 
-            # Solve the penalized normal equations without forming a matrix inverse.
+            # Solves the penalized normal equations without forming a matrix inverse.
             coef = np.linalg.solve(system, stats.rhs)
         except np.linalg.LinAlgError:
 
-            # Retain the penalty when covariates/source scores are redundant.
+            # Retains the penalty when covariates/source scores are redundant.
             warnings.warn("Singular Gaussian system; solving the penalized normal equations "
                           "by least squares.", RuntimeWarning, stacklevel=2)
             coef = np.linalg.lstsq(system, stats.rhs, rcond=None)[0]
@@ -266,7 +267,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
     if statistics is not None:
         raise ValueError("Gaussian cross-products cannot be used for logistic fitting.")
 
-    # Validate outcomes once per immutable design, without reading the PRS matrix.
+    # Validates outcomes once per immutable design, without reading the PRS matrix.
     cases = getattr(design, "_binary_cases", None)
 
     if cases is None:
@@ -282,7 +283,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
 
         design._binary_cases = cases
 
-    # Initialize the intercept from prevalence, clipping to keep the logit finite.
+    # Initializes the intercept from prevalence, clipping to keep the logit finite.
     start = np.zeros(p, dtype=np.float64)
     start[0] = float(logit(np.clip(cases / n, 1e-6, 1.0 - 1e-6)))
 
@@ -297,7 +298,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
     if workers > 1 and not callable(getattr(design, "read_block", None)):
         raise ValueError("Parallel logistic fitting requires a cached design.")
 
-    # Close workers before restoring BLAS limits, including when fitting fails.
+    # Closes workers before restoring BLAS limits, including when fitting fails.
     with ExitStack() as stack:
         pool = None
 
@@ -308,11 +309,12 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
         def objective_function(coef):
             if pool is not None:
                 return _parallel_binary_objective(design, coef, penalty, pool, workers)
+
             return _objective_gradient(design, coef, penalty, family)
 
         iterations = 0
 
-        # Report occasional optimizer progress without printing every function evaluation.
+        # Reports occasional optimizer progress without printing every function evaluation.
         def progress(coef):
             nonlocal iterations
             iterations += 1
@@ -320,7 +322,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
             if iterations % 25 == 0:
                 logger.info("Logistic fit: lambda=%g, iteration=%s", lambda_, iterations)
 
-        # Supply the mean logistic loss and its analytic gradient to L-BFGS-B.
+        # Supplies the mean logistic loss and its analytic gradient to L-BFGS-B.
         optimum = minimize(objective_function, start, jac=True, method="L-BFGS-B",
                            options=dict(BINARY_OPTIONS), callback=progress)
         coef = np.asarray(optimum.x, dtype=np.float64)

@@ -1,6 +1,7 @@
 """Run the individual-level MTL-PRS benchmark from packaged cohort inputs."""
 
 import argparse
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -21,13 +22,13 @@ comparators = ("Fixed-composition regional MultiPRS", "BLocPRS (1 Mb)")
 stages = ("prepare", "mixture", "weights", "fit", "score-validation", "select", "score-test", "collect")
 
 
-# Read a small numerical archive without Python object deserialization.
+# Archive loading reads numerical arrays without Python object deserialization.
 def load_arrays(path):
     with np.load(path, allow_pickle=False) as archive:
         return {name: archive[name] for name in archive.files}
 
 
-# Construct participant pairs in the saved dataset order.
+# Participant pairs follow the saved dataset order.
 def participant_ids(prepared, split):
     if split == "test":
         return np.column_stack((prepared["test_fid"], prepared["test_iid"]))
@@ -36,10 +37,9 @@ def participant_ids(prepared, split):
     return np.column_stack((prepared["fid"][rows], prepared["iid"][rows]))
 
 
-# Reserve the inner validation set once, keeping outer test outcomes out of preparation.
+# Preparation reserves the inner validation set once and excludes outer test outcomes.
 def prepare_run(args):
-    if args.dataset is None or args.family is None or not args.phenotype:
-        raise ValueError("The prepare stage needs --dataset, --family and --phenotype.")
+    assert args.dataset is not None and args.family is not None and args.phenotype
 
     args.ld_blocks.stat()
     prepared = prepare_data(args.dataset, args.family, args.validation_size, args.seed, args.validation_ids)
@@ -55,23 +55,27 @@ def prepare_run(args):
           f"{len(prepared['validation_rows']):,} validation and {len(prepared['test_iid']):,} test participants.")
 
 
-# Select raw-score mixture weights on update-training rows, then calibrate that mixture.
+# Mixture fitting selects raw-score weights on update-training rows and calibrates the selected mixture.
 def fit_mixture(run, prepared):
     rows = prepared["update_rows"]
     y, covariates, scores = (prepared[name][rows] for name in ("y", "covariates", "scores"))
+
+    # Five-fold CV selects the source mixture; calibration uses all update rows.
     pi, candidates = select_mixture(y, scores, covariates, prepared["source_names"],
                                     family=str(prepared["family"].item()), folds=5, step=.05,
                                     seed=int(prepared["seed"].item()))
     calibration = calibrate_baseline(y, covariates, scores, pi)
+
     candidates.to_csv(run / "mixture.tsv", sep="\t", index=False)
     np.savez(run / "calibration.npz", pi=pi, **calibration)
     print("Selected raw mixture: " + ", ".join(
         f"{source}={value:g}" for source, value in zip(prepared["source_names"], pi)))
 
 
-# Build chromosome mixtures before defining the genome-wide learning-rate denominator M.
+# Chromosome mixtures determine the genome-wide learning-rate denominator M.
 def build_weights(run, prepared, calibration):
     counts = []
+
     for chromosome in chromosomes:
         prefix = str(prepared["genotype_template"].item()).format(chrom=chromosome)
         count = prepare_weights(chromosome, prefix, str(prepared["scorefile_template"].item()),
@@ -79,10 +83,11 @@ def build_weights(run, prepared, calibration):
                                 run / "weights" / f"chr{chromosome}.tsv.gz")
         counts.append({"chromosome": chromosome, "variants": count})
         print(f"chr{chromosome}: {count:,} nonzero mixed SNP weights.")
+
     pd.DataFrame(counts).to_csv(run / "weights/counts.tsv", sep="\t", index=False)
 
 
-# Fit only update-training participants, using the same genome-wide M on every chromosome.
+# Chromosome fitting uses only update-training participants and the same genome-wide M.
 def fit_models(run, prepared, calibration, selected_chromosomes):
     counts = pd.read_csv(run / "weights/counts.tsv", sep="\t")
 
@@ -91,6 +96,7 @@ def fit_models(run, prepared, calibration, selected_chromosomes):
 
     total_variants = int(counts.variants.sum())
     ids = participant_ids(prepared, "update")
+
     for chromosome in selected_chromosomes:
         prefix = str(prepared["genotype_template"].item()).format(chrom=chromosome)
         summary = fit_chromosome(prefix, run / "weights" / f"chr{chromosome}.tsv.gz", ids,
@@ -100,7 +106,7 @@ def fit_models(run, prepared, calibration, selected_chromosomes):
               f"excluded {summary['dropped_monomorphic']:,} without training variation.")
 
 
-# Read the validation-selected candidate rather than selecting again on test data.
+# The selection table identifies the validation-selected candidate without test-data selection.
 def selected_label(run):
     table = pd.read_csv(run / "selection.tsv", sep="\t")
     selected = table.loc[table.selected.eq(True), "candidate_label"]
@@ -111,10 +117,11 @@ def selected_label(run):
     return str(selected.iloc[0])
 
 
-# Score all candidates on validation, but only the chosen candidate on the outer test set.
+# Validation scoring includes all candidates; outer test scoring includes only the chosen candidate.
 def score_models(run, prepared, split, selected_chromosomes):
     ids = participant_ids(prepared, split)
     label = selected_label(run) if split == "test" else None
+
     for chromosome in selected_chromosomes:
         prefix = str(prepared["genotype_template"].item()).format(chrom=chromosome)
         score_chromosome(prefix, run / "models" / f"chr{chromosome}.npz", ids,
@@ -122,13 +129,17 @@ def score_models(run, prepared, split, selected_chromosomes):
         print(f"chr{chromosome}: scored {len(ids):,} {split} participants.")
 
 
-# Require baseline reconstruction before validation can select among all 61 candidates.
+# Baseline reconstruction gates validation selection among all 61 candidates.
 def select_model(run, prepared, calibration):
     rows = prepared["validation_rows"]
     paths = [run / "validation" / f"chr{chromosome}.npz" for chromosome in chromosomes]
     labels, scores = combine_scores(paths, participant_ids(prepared, "validation"))
+
+    # The baseline check verifies that the unmodified candidate reconstructs the source mixture.
     baseline = int(np.flatnonzero(labels == "baseline").item())
     check = check_baseline(scores[:, baseline], prepared["scores"][rows], calibration["pi"], calibration["theta"])
+
+    # Update-path selection uses only reserved validation outcomes.
     selection = select_candidate(prepared["y"][rows], prepared["covariates"][rows], labels, scores,
                                  str(prepared["family"].item()))
     selection.to_csv(run / "selection.tsv", sep="\t", index=False)
@@ -138,13 +149,15 @@ def select_model(run, prepared, calibration):
     print(f"Selected {selected.candidate_label}: validation {selected.metric}={selected.value:.6g}.")
 
 
-# Accept either a joint score table or the two shared evaluator prediction exports.
+# Comparator loading accepts a joint score table or the two shared evaluator prediction exports.
 def load_comparators(paths, ids, phenotype=None):
     aliases = {comparators[0]: (comparators[0], "fixed_composition_mb1"),
                comparators[1]: (comparators[1], "blocprs_mb1")}
     scores = {}
+
     for path in paths:
         header = pd.read_csv(path, sep="\t", nrows=0).columns
+
         for method, names in aliases.items():
             matches = [name for name in names if name in header]
 
@@ -160,7 +173,7 @@ def load_comparators(paths, ids, phenotype=None):
     return pd.DataFrame(scores)[list(comparators)]
 
 
-# Evaluate frozen genetic scores and export the selected per-allele effects.
+# Result collection evaluates frozen genetic scores and exports the selected per-allele effects.
 def collect_results(args, prepared):
     if "phenotype" not in prepared:
         raise ValueError("Run the prepare stage with --phenotype before collecting results.")
@@ -179,12 +192,16 @@ def collect_results(args, prepared):
         raise ValueError("Test participant IDs changed after run preparation.")
 
     scores = pd.DataFrame({"MTL-PRS": values[:, 0]})
+
+    # Optional comparator scores align to the same test participants.
     if args.comparison_scores is not None:
         other = load_comparators(args.comparison_scores, ids, data.y)
         scores = pd.concat([scores, other], axis=1)
 
     family = str(prepared["family"].item())
     results = evaluate_scores(data, scores, family, "test")
+
+    # Uncertainty estimation leaves the selected genetic predictor unchanged.
     if args.bootstrap:
         uncertainty = bootstrap_metrics(data.y, data.covariates, scores, family=family,
                                         n_boot=args.bootstrap, seed=20260731)
@@ -192,6 +209,7 @@ def collect_results(args, prepared):
                                 on="method", how="left", validate="one_to_one")
         results["seed"] = 20260731
 
+    # Result exports contain test results, genetic predictions and the selected SNP effects.
     results["phenotype"] = str(prepared["phenotype"].item())
     results["family"] = "binary" if family == "binomial" else "continuous"
     predictions = pd.concat([pd.DataFrame(ids, columns=["FID", "IID"]), scores], axis=1)
@@ -202,7 +220,7 @@ def collect_results(args, prepared):
     print(results[["method", "metric", "value", "n", "status"]].to_string(index=False))
 
 
-# Keep scientific defaults fixed; expose cohort paths, split size and chromosome scheduling.
+# The CLI fixes scientific defaults and exposes cohort paths, split size and chromosome scheduling.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=stages)
@@ -224,6 +242,8 @@ def main():
     parser.add_argument("--bootstrap", nargs="?", const=10000, default=0, type=int, metavar="N",
                         help="Collect: paired bootstrap SEs and intervals; 10000 replicates when enabled.")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+    logging.info("MTL-PRS stage=%s; directory=%s", args.stage, args.run_dir)
 
     if args.bootstrap < 0 or args.bootstrap == 1:
         parser.error("--bootstrap must be 0 or at least 2.")
@@ -237,10 +257,13 @@ def main():
 
     prepared = load_arrays(args.run_dir / "prepared.npz")
     selected_chromosomes = chromosomes if args.chromosome is None else (args.chromosome,)
+
+    # Stage dispatch uses the stored training split and paths.
     if args.stage == "mixture":
         fit_mixture(args.run_dir, prepared)
     elif args.stage in {"weights", "fit", "select"}:
         calibration = load_arrays(args.run_dir / "calibration.npz")
+
         if args.stage == "weights":
             build_weights(args.run_dir, prepared, calibration)
         elif args.stage == "fit":

@@ -19,7 +19,7 @@ import pandas as pd
 __all__ = ["SNPWeights", "regional_coefficients", "export_snp_weights"]
 
 
-# Check names are unique and nonempty, without outer spaces, tabs, or newlines.
+# Checks names are unique and nonempty, without outer spaces, tabs, or newlines.
 def _names(values, label: str) -> list[str]:
     names = list(values)
 
@@ -36,7 +36,7 @@ def _names(values, label: str) -> list[str]:
     return names
 
 
-# Check fitted coefficients and compute each raw window score's multiplier.
+# Checks fitted coefficients and computes each raw window score's multiplier.
 def _model_arrays(model):
     try:
         sources = _names(model.source_names_, "source_names_")
@@ -62,7 +62,7 @@ def _model_arrays(model):
     if np.any(source_sd <= 0):
         raise ValueError("Source scales must be strictly positive.")
 
-    # c_eff = gamma + eta_centered; divide by training SD to weight raw scores.
+    # c_eff = gamma + eta_centered; division by training SD gives raw-score weights.
     centered = eta - eta.mean(axis=0, keepdims=True)
     effective = gamma[None, :] + centered
     multipliers = effective / source_sd[None, :]
@@ -73,7 +73,7 @@ def _model_arrays(model):
     return sources, windows, gamma, eta, window_mean, centered, effective, multipliers
 
 
-# Return genetic coefficients in fitted order, excluding intercept and covariates.
+# Returns genetic coefficients in fitted order, excluding intercept and covariates.
 # The table contains multipliers; export_snp_weights returns the centering offset.
 def regional_coefficients(model) -> pd.DataFrame:
     sources, windows, gamma, eta, _, centered, effective, multipliers = _model_arrays(model)
@@ -103,8 +103,8 @@ class SNPWeights:
     offset: float
     genome_build: str
 
-    # Write a TSV, then replace the destination only after writing finishes.
-    # Include the genome build and genetic centering offset in the TSV comments.
+    # Writes a TSV, then replaces the destination only after writing finishes.
+    # Includes the genome build and genetic centering offset in the TSV comments.
     def save(self, path: str | Path) -> Path:
         path = Path(path)
         temporary = None
@@ -128,7 +128,7 @@ class SNPWeights:
         return path
 
 
-# Validate text labels; allow_integer also accepts integer chromosome labels.
+# Validates text labels; allow_integer also accepts integer chromosome labels.
 def _text_column(frame: pd.DataFrame, column: str, *, allow_integer=False) -> None:
     values = frame[column]
 
@@ -150,7 +150,7 @@ def _text_column(frame: pd.DataFrame, column: str, *, allow_integer=False) -> No
     frame[column] = values
 
 
-# Read finite real numbers without treating malformed or missing values as zero.
+# Reads finite real numbers without treating malformed or missing values as zero.
 def _numeric_column(frame: pd.DataFrame, column: str) -> np.ndarray:
     try:
         if any(isinstance(value, (bool, np.bool_, complex, np.complexfloating)) for value in frame[column]):
@@ -171,7 +171,7 @@ def _numeric_column(frame: pd.DataFrame, column: str) -> np.ndarray:
     return result
 
 
-# Combine the complete, already harmonized source weights into one genetic predictor.
+# Combines the complete, already harmonized source weights into one genetic predictor.
 # Requires the dosage and imputation convention used for source scoring.
 # Optional allele_offset contains each row's constant in raw source-score units.
 def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | None = None) -> SNPWeights:
@@ -199,6 +199,7 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
 
     for column in ("source", "window", "variant_id", "effect_allele", "other_allele", "genome_build"):
         _text_column(frame, column)
+
     _text_column(frame, "chromosome", allow_integer=True)
     frame["weight"] = _numeric_column(frame, "weight")
     allele_offset = _numeric_column(frame, "allele_offset") if extra else None
@@ -232,7 +233,7 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
     if (frame.groupby("variant_id", sort=False)[identity].nunique() > 1).any().any():
         raise ValueError("A variant has inconsistent coordinates, oriented alleles, or window across sources.")
 
-    # Prevent counting one biological allele pair twice under different IDs.
+    # Prevents counting one biological allele pair twice under different IDs.
     variants = frame.drop_duplicates("variant_id").copy()
     variants["_allele_pair"] = [tuple(sorted(pair))
                                for pair in zip(variants["effect_allele"], variants["other_allele"])]
@@ -240,6 +241,7 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
     if variants.duplicated(["chromosome", "position", "_allele_pair"]).any():
         raise ValueError("Multiple variant IDs identify the same genomic allele pair.")
 
+    # Looks up each row's fitted coefficient by source and window labels.
     source_index = {name: index for index, name in enumerate(sources)}
     window_index = {name: index for index, name in enumerate(windows)}
     k = frame["source"].map(source_index).to_numpy(dtype=np.int64)
@@ -247,11 +249,11 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
     present = np.zeros(window_mean.shape, dtype=bool)
     present[w, k] = True
 
-    # Reject missing source/window pairs with a nonzero training mean.
+    # Rejects missing source/window pairs with a nonzero training mean.
     if np.any((~present) & (window_mean != 0)):
         raise ValueError("A missing source/window pair has a nonzero saved score mean; the panel is incomplete.")
 
-    # Apply each source/window multiplier before combining sources for the same SNP.
+    # Applies each source/window multiplier before combining sources for the same SNP.
     # sort=False keeps the first-seen variant order rather than sorting IDs.
     frame["weight"] = frame["weight"].to_numpy() * multipliers[w, k]
     combined = frame.groupby("variant_id", sort=False)["weight"].sum()
@@ -262,9 +264,10 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
         "other_allele", "weight", "genome_build", "window",
     ]].reset_index(drop=True)
 
-    # Center training scores and retain constants introduced by allele reversal.
+    # Computes the offset for training-score centering and allele-reversal constants.
     # Raw dosage scoring has no centering step, so the saved offset supplies it.
     offset = -float(np.sum(multipliers * window_mean))
+
     if allele_offset is not None:
         offset += float(np.sum(allele_offset * multipliers[w, k]))
 

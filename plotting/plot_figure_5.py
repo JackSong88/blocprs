@@ -11,13 +11,14 @@ from .plot_utils import (
 )
 
 
-# Use identical scales for effective and centered local coefficients within a trait.
+# Effective and centered local coefficients share identical scales within a trait.
 def build_figure(panels):
     fig = plt.figure(figsize=(183 / 25.4, 130 / 25.4))
     grid = fig.add_gridspec(4, 3, height_ratios=[.68, .68, 1.18, 1.18],
                             left=.075, right=.952, top=.900, bottom=.135, wspace=.265, hspace=.180)
     axes = np.empty((4, 3), dtype=object)
     cmap = mpl.colors.LinearSegmentedColormap.from_list("regional_coefficient", ["#355F8D", "#F7F7F5", "#B8424C"])
+
     for column, panel in enumerate(panels):
         for row in range(4):
             axes[row, column] = fig.add_subplot(grid[row, column], sharex=axes[0, column] if row else None)
@@ -38,6 +39,7 @@ def build_figure(panels):
         groups = (("Female",), ("Male",)) if panel["key"] == "creatinine" else (
             ("EUR",), tuple(source for source in panel["sources"] if source != "EUR"))
         labels = ("Female", "Male") if panel["key"] == "creatinine" else ("EUR", "Non-EUR")
+
         for ax, group, label in zip(axes[2:, column], groups, labels):
             regional_gwas_track(ax, panel, group, label)
 
@@ -46,6 +48,7 @@ def build_figure(panels):
             for ax in axes[:, column]:
                 ax.axvspan(left, right, facecolor="#D6A84F", edgecolor="#8A6B2F",
                            linewidth=.35, alpha=.09, zorder=5)
+
             center = (left + right) / 2
             ax = axes[0, column]
             ax.plot([center, center], [1, 1.027], transform=ax.get_xaxis_transform(),
@@ -53,6 +56,8 @@ def build_figure(panels):
             ax.text(center, 1.04, name, transform=ax.get_xaxis_transform(), ha="center", va="bottom",
                     fontsize=5.5, fontweight="semibold", color="#6F5628",
                     fontstyle="normal" if name == "MHC" else "italic")
+
+        # One colorbar serves both coefficient tracks.
         upper, lower = axes[0, column].get_position(), axes[1, column].get_position()
         cax = fig.add_axes([upper.x1 + .0045, lower.y0, .006, upper.y1 - lower.y0])
         colorbar = fig.colorbar(mesh, cax=cax, ticks=[-limit, 0, limit])
@@ -65,10 +70,14 @@ def build_figure(panels):
         fig.text(upper.x0, .968, "abc"[column], fontsize=8, fontweight="bold", va="top")
         fig.text(upper.x0 + .020, .968, f"{panel['title']} - chromosome {panel['chromosome']}",
                  fontsize=7, va="top")
+
+    # Shared track labels sit outside the three phenotype panels.
     label_x = axes[0, 0].get_position().x0 - .043
+
     for row, text in ((0, "Effective\ncoefficient"), (1, "Locus-specific\nadjustment")):
         box = axes[row, 0].get_position()
         fig.text(label_x, (box.y0 + box.y1) / 2, text, ha="center", va="center", rotation=90, fontsize=6.2)
+
     top, bottom = axes[2, 0].get_position().y1, axes[3, 0].get_position().y0
     fig.text(label_x, (top + bottom) / 2, "GWAS association\n" + r"$-\log_{10}(P)$",
              ha="center", va="center", rotation=90, fontsize=6.2)
@@ -79,13 +88,17 @@ def build_figure(panels):
     fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(center, .016), ncol=4,
                frameon=False, handletextpad=.25, columnspacing=.75, fontsize=6,
                title="Non-EUR ancestry", title_fontsize=6)
+
     return fig
 
 
-# Read dedicated analysis inputs and export the combined map.
+# The command reads dedicated analysis inputs and exports the combined map.
 def main():
     args = parse_args(__doc__, interpretation=True, regional=True)
+
+    # Each region's inputs include coefficients, training scales and GWAS tracks.
     panels = [load_regional_panel(args.data_root, spec, args.analysis_dir, args.gwas_template) for spec in regional_specs[:3]]
+
     with plt.rc_context(style):
         save_figure(build_figure(panels), args.output_dir / "Figure_5.pdf")
 

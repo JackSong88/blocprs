@@ -19,11 +19,12 @@ analyses = core_phenotypes + [(name, "continuous") for name in (
     "LDL_ADJ_MA", "TC_ADJ_MA", "DBP_ADJ_MA", "SBP_ADJ_MA")]
 
 
-# Compare every regularized fit to unregularized MultiPRS on the same evaluation set.
+# Each regularized fit is compared with unregularized MultiPRS on the same evaluation set.
 def load_results(path):
     data = read_results(path)
     records = []
     tokens = ("ridge", "lasso", "elastic_net", "nonnegative")
+
     for cohort in cohorts:
         for phenotype, family in analyses:
 
@@ -44,8 +45,10 @@ def load_results(path):
                 if row.n != baseline.n:
                     raise ValueError("Regularization methods evaluate different participant counts.")
 
+                # Each phenotype contributes its own percentage change before averaging.
                 records.append(dict(cohort=cohort, phenotype=phenotype, family=family, method=method,
                                     relative_change_pct=100 * (row.value / baseline.value - 1)))
+
     return pd.DataFrame(records)
 
 
@@ -54,10 +57,13 @@ def build_figure(data):
     fig, axes = plt.subplots(1, 2, figsize=(183 / 25.4, 100 / 25.4), sharey=True)
     fig.subplots_adjust(left=.09, right=.985, bottom=.21, top=.85, wspace=.12)
     limits = (min(-5, data.relative_change_pct.min()*1.05), max(5, data.relative_change_pct.max()*1.05))
+
     for index, (ax, (cohort, title)) in enumerate(zip(axes, cohorts.items())):
         style_axis(ax, grid_axis="y")
+
         for family, offset, marker in (("continuous", -.15, "o"), ("binary", .15, "s")):
             color = family_colors[family]
+
             for x, method in enumerate(methods):
                 frame = data.loc[data.cohort.eq(cohort) & data.family.eq(family)
                                  & data.method.eq(method)].sort_values("phenotype")
@@ -66,17 +72,21 @@ def build_figure(data):
                        edgecolor="#666666", linewidth=.25, zorder=3)
                 ax.scatter(x+offset+np.linspace(-.085, .085, len(values)), values, s=5.5, marker=marker,
                            color=color, alpha=.48, edgecolors="white", linewidths=.15, zorder=4)
+
         ax.axhline(0, color="#4A4A4A", linewidth=.45, zorder=2)
         ax.set(xlim=(-.5, 3.5), ylim=limits)
         ax.set_xticks(range(4), method_labels)
+
         if limits == (-5, 5):
             ax.set_yticks((-5, -2.5, 0, 2.5, 5))
+
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
         ax.tick_params(labelsize=6.5, left=index == 0, labelleft=index == 0)
         ax.spines["left"].set_visible(index == 0)
         box = ax.get_position()
         fig.text(box.x0, .875, "ab"[index], fontsize=8, fontweight="bold", va="bottom")
         fig.text((box.x0+box.x1)/2, .875, title, fontsize=7, ha="center", va="bottom")
+
     axes[0].set_ylabel(r"Relative change in $R^2$ vs MultiPRS (%)", fontsize=6.8, labelpad=6)
     handles = [Patch(facecolor=color, edgecolor="none", label=family.capitalize())
                for family, color in family_colors.items()]
@@ -85,13 +95,16 @@ def build_figure(data):
                        label="Point: phenotype-panel analysis")]
     fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .06), ncol=4,
                frameon=False, fontsize=5.7, columnspacing=1.4, handlelength=1.6, handletextpad=.45)
+
     return fig
 
 
-# Export the sensitivity comparison from saved evaluations.
+# Sensitivity-comparison export uses saved evaluations.
 def main():
     args = parse_args(__doc__, supplementary=True, collection="regularization")
+
     data = load_results(args.results)
+
     with plt.rc_context(style):
         save_figure(build_figure(data), args.output_dir / "suppl_regularization.pdf")
 

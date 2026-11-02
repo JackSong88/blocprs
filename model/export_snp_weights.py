@@ -1,6 +1,7 @@
 """Combine a saved model and canonical or harmonized source SNP weights into one TSV."""
 
 import argparse
+import logging
 import csv
 import gzip
 from pathlib import Path
@@ -11,12 +12,12 @@ from blocprs import BLocPRS, export_snp_weights
 from blocprs.canonical_export import export_canonical_snp_weights
 
 
-# Read source labels and variant identifiers without converting them to numbers.
+# Reads source labels and variant identifiers without converting them to numbers.
 def read_source_weights(path):
     path = Path(path)
     opener = gzip.open if path.suffix == ".gz" else open
 
-    # Check headers before pandas renames duplicate columns.
+    # Checks headers before pandas renames duplicate columns.
     with opener(path, "rt", newline="") as stream:
         header = next(csv.reader(stream, delimiter="\t"))
 
@@ -26,8 +27,9 @@ def read_source_weights(path):
     return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
 
 
-# Apply frozen genetic coefficients using generic weights or the assigned canonical crosswalk.
+# Applies frozen genetic coefficients using generic weights or the assigned canonical crosswalk.
 def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True, help="Saved BLocPRS model archive.")
     inputs = parser.add_mutually_exclusive_group(required=True)
@@ -48,7 +50,10 @@ def main(argv=None):
     if args.source_weights and any(value is not None for value in (args.cohort, args.genome_build, args.pvar_template)):
         parser.error("--cohort, --genome-build and --pvar-template apply only to --cross-mapping.")
 
+    # Loads the fitted coefficients and combines the corresponding source weights.
+    print(f"Loading model and combining source SNP weights: {args.model}", flush=True)
     model = BLocPRS.load(args.model)
+
     if args.cross_mapping:
         combined = export_canonical_snp_weights(model, args.cross_mapping, cohort=args.cohort,
                                                genome_build=args.genome_build, pvar_template=args.pvar_template)
@@ -56,6 +61,7 @@ def main(argv=None):
         source_weights = read_source_weights(args.source_weights)
         combined = export_snp_weights(model, source_weights)
 
+    # Writes one variant-weight table, including the additive centering offset.
     args.output.parent.mkdir(parents=True, exist_ok=True)
     combined.save(args.output)
     print(f"variants={len(combined.weights)} build={combined.genome_build} "

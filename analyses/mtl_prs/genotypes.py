@@ -6,14 +6,16 @@ import numpy as np
 import pandas as pd
 
 
-# Keep the header while skipping optional PLINK metadata lines.
+# Metadata loading skips optional PLINK metadata lines while retaining the header.
 def _read_metadata(path):
     with Path(path).open() as handle:
         while True:
             position = handle.tell()
+
             if not handle.readline().startswith("##"):
                 handle.seek(position)
                 break
+
         return pd.read_csv(handle, sep=r"\s+", dtype=str, keep_default_na=False)
 
 
@@ -24,11 +26,15 @@ class PgenDosages:
         import pgenlib
 
         prefix = str(prefix)
+
         for suffix in (".pgen", ".pvar", ".psam"):
             if prefix.endswith(suffix):
                 prefix = prefix[:-len(suffix)]
                 break
+
         self.prefix = prefix
+
+        # PVAR metadata supplies variant coordinates and the alleles counted by PGEN.
         pvar = _read_metadata(f"{prefix}.pvar")
         chromosome = pvar["#CHROM"].str.replace(r"^chr", "", regex=True)
         position = pd.to_numeric(pvar["POS"], errors="raise").astype(np.int64)
@@ -49,7 +55,9 @@ class PgenDosages:
         if self.variants["snp"].duplicated().any():
             raise ValueError("PVAR contains duplicate canonical variant IDs")
 
+        # The sample lookup maps participant IDs to their genotype rows.
         psam = _read_metadata(f"{prefix}.psam").rename(columns={"#FID": "FID", "#IID": "IID"})
+
         if "FID" not in psam:
             psam["FID"] = psam["IID"]
 
@@ -64,7 +72,7 @@ class PgenDosages:
             f"{prefix}.pgen".encode(), raw_sample_ct=self.n_samples, variant_ct=self.n_variants)
         self._active_subset = None
 
-    # Resolve exact FID/IID pairs without dropping or reordering participants.
+    # Participant lookup resolves exact FID/IID pairs without dropping or reordering participants.
     def sample_indices(self, ids):
         ids = np.asarray(ids, dtype=str)
 
@@ -72,16 +80,18 @@ class PgenDosages:
             raise ValueError("Participant IDs must have FID and IID columns")
 
         pairs = [tuple(pair) for pair in ids]
+
         if len(set(pairs)) != len(pairs):
             raise ValueError("Requested participant IDs contain duplicate FID/IID pairs")
 
         missing = [pair for pair in pairs if pair not in self._sample_lookup]
+
         if missing:
             raise ValueError(f"{len(missing)} participants are absent from PSAM: {missing[:5]}")
 
         return np.asarray([self._sample_lookup[pair] for pair in pairs], dtype=np.int64)
 
-    # Pgenlib requires sorted sample subsets; restore the caller's order afterward.
+    # Pgenlib receives sorted sample subsets; returned dosages follow the caller's original order.
     def read(self, variant_indices, sample_indices=None):
         variants = np.asarray(variant_indices, dtype=np.int64)
         samples = (np.arange(self.n_samples) if sample_indices is None
@@ -101,6 +111,7 @@ class PgenDosages:
 
         order = np.argsort(samples, kind="stable")
         subset = np.ascontiguousarray(samples[order], dtype=np.uint32)
+
         if self._active_subset is None or not np.array_equal(subset, self._active_subset):
             self._reader.change_sample_subset(subset)
             self._active_subset = subset
@@ -108,20 +119,21 @@ class PgenDosages:
         dosage = np.empty((len(variants), len(samples)), dtype=np.float32)
         self._reader.read_dosages_list(np.ascontiguousarray(variants, dtype=np.uint32), dosage)
 
-        # Convert Pgenlib's missing-dosage sentinel before later mean imputation.
+        # Pgenlib's missing-dosage sentinel becomes NaN for later mean imputation.
         dosage[dosage < -8.0] = np.nan
+
         return np.ascontiguousarray(dosage.T[np.argsort(order)])
 
-    # Release the native reader exactly once.
+    # Closing releases the native reader exactly once.
     def close(self):
         if self._reader is not None:
             self._reader.close()
             self._reader = None
 
-    # Scope each chromosome's reader to its operation.
+    # The context manager scopes each chromosome's reader to its operation.
     def __enter__(self):
         return self
 
-    # Close on both successful operations and exceptions.
+    # Context exit closes the reader after both successful operations and exceptions.
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()

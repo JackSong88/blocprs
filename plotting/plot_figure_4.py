@@ -53,6 +53,7 @@ def load_values(path):
                        "Nonwindowed MultiPRS", "Fixed-composition regional MultiPRS",
                        "BLocPRS mb1"], METHODS))
     data["method"] = data.method.map(labels)
+
     return data.rename(columns={"phenotype": "Phenotype", "family": "Family", "method": "Model",
                                 "value": "Value", "n": "N", "source": "Source"})
 
@@ -60,23 +61,28 @@ def load_values(path):
 def plot_figure(data):
     figure_style = {**style, "axes.labelsize": 6.9, "xtick.labelsize": 6.4,
                     "ytick.labelsize": 6.7, "legend.fontsize": 7.0}
+
     with mpl.rc_context(figure_style):
         fig, axes = plt.subplots(1, 2, figsize=(183 / 25.4, 135 / 25.4))
         fig.subplots_adjust(left=0.112, right=0.985, top=0.905, bottom=0.082, wspace=0.28)
         families = [("continuous", r"Incremental $R^2$"), ("binary", r"Nagelkerke $R^2$")]
+
         for column, (family, metric) in enumerate(families):
             ax = axes[column]
             panel = data.loc[data["Family"].eq(family)]
 
-            # Use one BLocPRS-based trait order for all five methods within each outcome family.
+            # All five methods share the trait order defined by BLocPRS scores within each outcome family.
             phenotypes = (panel.loc[panel["Model"].eq(METHODS[-1])]
                           .sort_values(["Value", "Phenotype"], kind="mergesort")["Phenotype"].tolist())
             spacing = 1.05
             y = np.arange(len(phenotypes), dtype=float) * spacing
+
             for index in range(0, len(phenotypes), 2):
                 ax.axhspan(y[index] - spacing / 2, y[index] + spacing / 2,
                            facecolor="#F6F7F7", edgecolor="none", zorder=0)
+
             indexed = panel.set_index(["Model", "Phenotype"])
+
             for index, method in enumerate(METHODS):
                 values = indexed.loc[method].reindex(phenotypes)
                 color = method_colors[LABELS[index]]
@@ -88,6 +94,8 @@ def plot_figure(data):
                             markerfacecolor="white" if index == 0 else color,
                             markeredgewidth=0.55, ecolor=color, elinewidth=0.55,
                             capsize=0, alpha=1.0, zorder=3)
+
+            # Each family axis includes complete uncertainty intervals.
             minimum = min(0.0, float((panel["Value"] - panel["bootstrap_se"]).min()))
             maximum = float((panel["Value"] + panel["bootstrap_se"]).max())
             ax.set_xlim(minimum * 1.055, maximum * 1.055)
@@ -103,11 +111,15 @@ def plot_figure(data):
             ax.set_axisbelow(True)
             ax.tick_params(axis="y", length=2.5, width=0.55, pad=2.2)
             ax.tick_params(axis="x", length=3.0, width=0.65, pad=1.7)
+
             for spine in ["left", "bottom"]:
                 ax.spines[spine].set_color("#52595C")
                 ax.spines[spine].set_linewidth(0.55)
+
             ax.text(0, 1.025, "AB"[column], transform=ax.transAxes, ha="left", va="bottom",
                     fontsize=8.4, fontweight="bold", color="#222222", clip_on=False)
+
+        # One method legend serves both outcome families.
         handles = [Line2D([], [], linestyle="none", marker=MARKERS[index],
                           markersize=MARKER_SIZES[index] + 0.8,
                           markerfacecolor="white" if index == 0 else method_colors[label],
@@ -116,12 +128,16 @@ def plot_figure(data):
         fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.985), ncols=5,
                    frameon=False, handlelength=0.85, handleheight=0.90, handletextpad=0.42,
                    columnspacing=0.85, borderaxespad=0, fontsize=7.0)
+
     return fig
 
 
 def main():
     args = parse_args(__doc__, collection="progression")
+
+    # Plot inputs include model-progression estimates and their saved bootstrap SEs.
     data = load_values(args.results)
+
     save_figure(plot_figure(data), args.output_dir / "Figure_4.pdf")
 
 
