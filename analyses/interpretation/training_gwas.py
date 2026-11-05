@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import pandas as pd
 
-from blocprs.selection import filter_participants, id_positions, read_participants
+from participant_utils import filter_participants, id_positions, read_participants
 
 
 # Participant selection starts from stored training rows and applies optional restrictions.
@@ -30,7 +30,7 @@ def training_participants(dataset, family, train_ids=None, ancestry=None, sex=No
     participants = filter_participants(participants, ancestry=[ancestry] if ancestry else None,
                                       sex=[sex_code] if sex_code is not None else None).copy()
 
-    if participants.empty or not participants.split.eq("train").all():
+    if participants.empty:
         raise ValueError("GWAS requires a nonempty subset of the saved training split.")
 
     y = participants.phenotype.to_numpy(dtype=float)
@@ -125,13 +125,11 @@ def run_gwas(dataset, phenotype, family, chromosome, pfile="data/ukbb/genotypes/
     assert 1 <= chromosome <= 22 and num_pcs >= 0 and mac >= 0 and threads >= 1
     assert family in ("gaussian", "binomial") and sex in (None, "female", "male")
 
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", phenotype):
-        raise ValueError("Use a phenotype label beginning with a letter, followed by letters, numbers or underscores.")
+    assert re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", phenotype)
 
     group = "_".join(value for value in (ancestry, sex) if value) or "all"
 
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", group):
-        raise ValueError("Ancestry labels may contain letters, numbers, underscores and hyphens.")
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", group)
 
     prefix = Path(str(pfile).format(chrom=chromosome))
 

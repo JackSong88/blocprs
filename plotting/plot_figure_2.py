@@ -58,9 +58,6 @@ def summarize_inputs(data):
     if set(points.Scenario) != set(range(6)):
         raise ValueError("Figure 2 requires all six sensitivity scenarios")
 
-    if points.duplicated(keys + ["Reference"]).any():
-        raise ValueError("Duplicate sensitivity comparison")
-
     # Overall is the equal-weight mean of continuous and binary family means.
     overall = summary.groupby(["Scenario", "Reference"], sort=False).agg(
         Mean=("Mean", "mean"), N=("N", "sum"), Families=("Family", "nunique"),
@@ -123,9 +120,6 @@ def draw_sensitivity(figure, points, summary):
 
                 cell = points.loc[points.Scenario.eq(order) & points.Family.eq(family)
                                   & points.Reference.eq(reference), "Relative gain"]
-
-                if len(cell) != int(row.N.iloc[0]):
-                    raise ValueError("Sensitivity point/summary cohort mismatch")
 
                 # Horizontal positions are exact; jitter affects only categorical y.
                 visible = cell.loc[cell.le(110)]

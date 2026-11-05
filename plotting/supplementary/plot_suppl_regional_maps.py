@@ -51,9 +51,12 @@ def build_figure(panel):
     regional_heatmap(axes[4], panel, panel["contributions"][2], cmap, norm, fontsize=7)
 
     # GWAS tracks separate sex-specific scans or EUR/non-EUR ancestry groups.
-    groups = (("Female",), ("Male",)) if panel["key"] == "creatinine" else (
-        ("EUR",), tuple(source for source in panel["sources"] if source != "EUR"))
-    labels = ("Female", "Male") if panel["key"] == "creatinine" else ("EUR", "Non-EUR")
+    if panel["key"] == "creatinine":
+        groups = (("Female",), ("Male",))
+        labels = ("Female", "Male")
+    else:
+        groups = (("EUR",), tuple(source for source in panel["sources"] if source != "EUR"))
+        labels = ("EUR", "Non-EUR")
 
     for ax, group, label in zip(axes[5:], groups, labels):
         regional_gwas_track(ax, panel, group, label, detailed=True)

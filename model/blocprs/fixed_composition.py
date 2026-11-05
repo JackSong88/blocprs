@@ -36,11 +36,9 @@ def _rows(data, rows, scores=None, source_names=None):
 
 # Checks that the two independently prepared datasets describe the same rows.
 def _aligned_inputs(windowed, genomewide):
-    if not isinstance(windowed, PRSData) or not isinstance(genomewide, PRSData):
-        raise ValueError("Supply windowed and genome-wide PRSData objects.")
+    assert isinstance(windowed, PRSData) and isinstance(genomewide, PRSData)
 
-    if windowed.y is None or genomewide.y is None or genomewide.n_windows != 1:
-        raise ValueError("Both training inputs need outcomes; genome-wide scores need one window.")
+    assert windowed.y is not None and genomewide.y is not None and genomewide.n_windows == 1
 
     if windowed.source_names != genomewide.source_names or windowed.covariate_names != genomewide.covariate_names:
         raise ValueError("Source and covariate names must match in the same order.")
@@ -78,6 +76,8 @@ class FixedCompositionBLocPRS:
 
     An unregularized MultiPRS fit defines the source mixture. A one-source
     BLocPRS model estimates its global coefficient and regional adjustments.
+    This second stage treats the mixture as K=1: its gamma and eta recalibrate
+    that combined score, not the original sources independently.
     Regional CV uses the BLocPRS penalty grid and evaluation metrics, with
     both stages refitted within each training fold. The final fit uses all
     training participants.
@@ -107,8 +107,7 @@ class FixedCompositionBLocPRS:
 
         total = (available // folds) * folds
 
-        if total < folds:
-            raise ValueError("Too few training participants for the requested CV folds.")
+        assert total >= folds
 
         sampled = _subsample_indices(data.y, total, np.random.RandomState(self.random_state),
                                      stratify=self.family == "binomial", min_per_class=folds)
@@ -123,7 +122,10 @@ class FixedCompositionBLocPRS:
                 raise ValueError("Binary CV needs at least cv_folds sampled participants in each class.")
 
         results = [{"lambda": float(value), "mean_score": None, "fold_scores": []} for value in candidates]
-        fitting_order = sorted(results, key=lambda entry: -entry["lambda"]) if self.family == "binomial" else results
+        if self.family == "binomial":
+            fitting_order = sorted(results, key=lambda entry: -entry["lambda"])
+        else:
+            fitting_order = results
 
         logging.getLogger(__name__).info("Fixed-composition CV: N=%s, folds=%s, penalties=%s", total, folds, len(results))
 
@@ -133,7 +135,7 @@ class FixedCompositionBLocPRS:
             mixture = MultiPRS(self.family, variant="unregularized", block_size=self.block_size)
             mixture.fit(_rows(genomewide_data, sampled[train_rows]))
 
-            # Converts standardized-score coefficients to weights on raw window scores.
+            # First-stage gamma_k / sigma_k gives weights on raw window scores S_tilde_iwk.
             # The second-stage training centering accounts for the mixture's constant offset.
             source_weights = mixture.gamma_ / mixture.scaler_.source_sd
             combined = _combined_data(data, source_weights, self.block_size, sampled)
@@ -178,7 +180,10 @@ class FixedCompositionBLocPRS:
 
         assert self.family in ("gaussian", "binomial")
 
-        candidates = np.logspace(-3, 3, 25) if self.lambda_grid is None else np.asarray(self.lambda_grid, dtype=float)
+        if self.lambda_grid is None:
+            candidates = np.logspace(-3, 3, 25)
+        else:
+            candidates = np.asarray(self.lambda_grid, dtype=float)
 
         if (candidates.ndim != 1 or len(candidates) == 0 or not np.isfinite(candidates).all()
             or np.any(candidates < 0) or len(np.unique(candidates)) != len(candidates)):
@@ -196,7 +201,7 @@ class FixedCompositionBLocPRS:
         # Refits the genome-wide mixture on all training participants.
         mixture = MultiPRS(self.family, variant="unregularized", block_size=self.block_size).fit(genomewide_data)
 
-        # Freezes one source composition across windows; only its regional scaling can vary.
+        # Freezes first-stage gamma_k / sigma_k across windows before one-source regional fitting.
         source_weights = mixture.gamma_ / mixture.scaler_.source_sd
         combined = _combined_data(data, source_weights, self.block_size)
         regional = BLocPRS(self.family, lambda_=selected, block_size=self.block_size).fit(combined)
@@ -215,8 +220,7 @@ class FixedCompositionBLocPRS:
 
     # Checks the original source and window order before applying the fitted mixture.
     def _check_prediction_data(self, data):
-        if not hasattr(self, "regional_"):
-            raise ValueError("Fit or load a fixed-composition model before prediction.")
+        assert hasattr(self, "regional_"), "Fit or load the model first."
 
         if data.source_names != self.source_names_ or data.window_names != self.window_names_:
             raise ValueError("Source/window names or their order differ from the fitted model.")
@@ -266,8 +270,7 @@ class FixedCompositionBLocPRS:
 
     # Stores both existing model archives inside one pickle-free NumPy archive.
     def save(self, path):
-        if not hasattr(self, "regional_"):
-            raise ValueError("Fit or load a fixed-composition model before saving it.")
+        assert hasattr(self, "regional_"), "Fit or load the model first."
 
         path = Path(path)
         metadata = {

@@ -87,13 +87,17 @@ def build_figure(data, expanded):
         right_ax = fig.add_axes([113/width, (157-35*row)/height, 60/width, 24/height])
 
         for index, (panel, color) in enumerate(zip(panels, colors)):
-            frame = data.loc[data.phenotype.eq(phenotype) & data.panel.eq(panel)].set_index("window").loc[list(windows)]
+            selected_panel = data.phenotype.eq(phenotype) & data.panel.eq(panel)
+            frame = data.loc[selected_panel].set_index("window")
+            frame = frame.loc[list(windows)]
             left_ax.bar(np.arange(3)*.8+(index-1)*.17, frame.value, width=.15, color=color,
                         edgecolor="none", yerr=frame.bootstrap_se,
                         error_kw=dict(ecolor="#414141", elinewidth=.48, capsize=0))
 
         for index, (design, color) in enumerate((("Standard", "#3182BD"), ("Expanded", "#6A51A3"))):
-            frame = expanded.loc[expanded.phenotype.eq(phenotype) & expanded.design.eq(design)].set_index("window").loc[list(windows)]
+            selected_design = expanded.phenotype.eq(phenotype) & expanded.design.eq(design)
+            frame = expanded.loc[selected_design].set_index("window")
+            frame = frame.loc[list(windows)]
             right_ax.bar(np.arange(3)*.8+(index-.5)*.17, frame.value, width=.15, color=color,
                          edgecolor="none", yerr=frame.bootstrap_se,
                          error_kw=dict(ecolor="#414141", elinewidth=.48, capsize=0))

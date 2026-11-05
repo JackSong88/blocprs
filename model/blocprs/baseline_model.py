@@ -12,7 +12,6 @@ import logging
 import os
 import tempfile
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +22,7 @@ from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from .cv import _positive_integer, _subsample_indices
-from .data import PRSData, select_sources
+from .data import GenomewideScaler, PRSData, select_sources
 from .metrics import IncrementalR2, NagelkerkeR2
 
 
@@ -32,7 +31,7 @@ def select_source(data, source):
     return select_sources(data, [source])
 
 
-# Sums raw window scores explicitly when a genome-wide dataset is unavailable.
+# Computes raw S_tilde_ik = sum_w S_tilde_iwk when a genome-wide dataset is unavailable.
 def genomewide_data(data, block_size=8192):
     block_size = _positive_integer(block_size, "block_size")
     scores = np.empty((data.n_samples, 1, data.n_sources), dtype=np.float64)
@@ -44,25 +43,6 @@ def genomewide_data(data, block_size=8192):
     return PRSData(scores, data.source_names, ["genomewide"], y=data.y,
                    covariates=data.covariates, covariate_names=data.covariate_names,
                    sample_ids=data.sample_ids)
-
-
-@dataclass
-class _SourceScaler:
-    """Training means and population SDs of source scores; covariates and y remain unscaled."""
-
-    source_mean: np.ndarray
-    source_sd: np.ndarray
-
-    # Computes source scaling only on the supplied fitting participants.
-    @classmethod
-    def fit(cls, sources):
-        sd = np.std(sources, axis=0, ddof=0)
-        sd[sd == 0] = 1
-        return cls(np.mean(sources, axis=0), sd)
-
-    # Applies the saved training means and SDs to new participants.
-    def transform(self, sources):
-        return (sources - self.source_mean) / self.source_sd
 
 
 # Removes the intercept/covariate component before continuous source fitting (FWL).
@@ -82,7 +62,7 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
     n, k = sources.shape
     p = nuisance.shape[1]
 
-    # Splits the source penalty into its L1 and L2 parts.
+    # Splits the penalty on gamma_k into L1 and L2 parts; covariates remain unpenalized.
     l1 = lambda_ * ratio
     l2 = lambda_ * (1 - ratio)
 
@@ -129,15 +109,20 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
     # Returns the fitted null model exactly at the L1 zero-solution bound.
     # When the penalty exceeds every source gradient, zero source effects are optimal.
     if l1 > 0:
-        null_coef, null_info, max_gradient = (_binomial_null(nuisance, sources, y)
-                                             if null_fit is None else null_fit)
+        if null_fit is None:
+            null_coef, null_info, max_gradient = _binomial_null(nuisance, sources, y)
+        else:
+            null_coef, null_info, max_gradient = null_fit
 
         if lambda_ >= max_gradient / ratio:
             return np.concatenate((null_coef, np.zeros(k))), dict(null_info)
 
     # Logistic fitting estimates covariate and source coefficients jointly.
     design = np.column_stack((nuisance, sources))
-    initial = np.zeros(p + k) if initial is None else np.asarray(initial, dtype=float).copy()
+    if initial is None:
+        initial = np.zeros(p + k)
+    else:
+        initial = np.asarray(initial, dtype=float).copy()
 
     if not np.any(initial):
         initial[0] = logit(np.clip(y.mean(), 1e-6, 1 - 1e-6))
@@ -170,7 +155,10 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
 
             return float(value), gradient
 
-        bounds = [(None, None)] * p + [(0, None)] * k if variant == "nonnegative" else None
+        if variant == "nonnegative":
+            bounds = [(None, None)] * p + [(0, None)] * k
+        else:
+            bounds = None
 
     result = minimize(objective, start, jac=True, method="L-BFGS-B", bounds=bounds,
                       options={"maxiter": 1000 if l1 > 0 else 2000, "maxls": 50,
@@ -179,8 +167,10 @@ def _fit_once(nuisance, sources, y, family, variant, lambda_, ratio=0.0,
     if not result.success or not np.isfinite(result.fun) or not np.isfinite(result.x).all():
         raise RuntimeError(f"MultiPRS logistic fit did not converge: {result.message}")
 
-    coef = (np.concatenate((result.x[:p], result.x[p:p + k] - result.x[p + k:]))
-            if l1 > 0 else result.x)
+    if l1 > 0:
+        coef = np.concatenate((result.x[:p], result.x[p:p + k] - result.x[p + k:]))
+    else:
+        coef = result.x
 
     return coef, {"objective": float(result.fun), "iterations": int(result.nit), "converged": True}
 
@@ -209,7 +199,7 @@ def _lambda_max(nuisance, sources, y, family, ratio, residuals=None, null_fit=No
 class MultiPRS:
     """Genome-wide PRS combination by linear or logistic regression.
 
-    Input PRSData must contain one genome-wide column per source (W=1).
+    Input PRSData contains raw S_tilde_ik, one genome-wide column per source (W=1).
     Use genomewide_data explicitly to construct sums from window inputs.
     Covariates and phenotypes remain in their supplied units. Source scores
     use training-fold means and SDs during CV and full-training values for refitting.
@@ -232,8 +222,7 @@ class MultiPRS:
 
     # Checks the score layout and finite inputs without guessing window aggregation.
     def _arrays(self, data, training=False):
-        if not isinstance(data, PRSData) or data.n_windows != 1:
-            raise ValueError("MultiPRS requires PRSData with one genome-wide score per source.")
+        assert isinstance(data, PRSData) and data.n_windows == 1
 
         sources = np.asarray(data.window_scores[:, 0], dtype=np.float64)
         covariates = np.asarray(data.covariates, dtype=np.float64)
@@ -279,7 +268,12 @@ class MultiPRS:
             raise ValueError("Penalties must be distinct, finite, nonnegative values.")
 
         if self.variant == "elasticnet":
-            ratios = ([0.1, 0.5, 0.9] if search else [0.5]) if self.l1_ratios is None else list(self.l1_ratios)
+            if self.l1_ratios is not None:
+                ratios = list(self.l1_ratios)
+            elif search:
+                ratios = [0.1, 0.5, 0.9]
+            else:
+                ratios = [0.5]
         else:
             assert self.l1_ratios is None
 
@@ -305,11 +299,14 @@ class MultiPRS:
 
         # Recomputes source scaling on all training rows for the final fit.
         logging.getLogger(__name__).info("Baseline full training fit: variant=%s, N=%s", self.variant, len(y))
-        scaler = _SourceScaler.fit(sources)
+        scaler = GenomewideScaler.fit(sources)
         standardized = scaler.transform(sources)
         residuals = _residuals(nuisance, standardized, y) if self.family == "gaussian" else None
-        null_fit = (_binomial_null(nuisance, standardized, y)
-                    if self.family == "binomial" and self.variant in ("lasso", "elasticnet") else None)
+        if self.family == "binomial" and self.variant in ("lasso", "elasticnet"):
+            null_fit = _binomial_null(nuisance, standardized, y)
+        else:
+            null_fit = None
+
         lambda_ = selected
 
         if search and self.variant in ("lasso", "elasticnet"):
@@ -335,11 +332,14 @@ class MultiPRS:
     # Refits source scaling and the comparator independently within every CV fold.
     def _cross_validate(self, sources, covariates, y, candidates, ratios):
         folds = _positive_integer(self.cv_folds, "cv_folds", minimum=2)
-        cap = len(y) if self.cv_max_samples is None else _positive_integer(self.cv_max_samples, "cv_max_samples", folds)
+        if self.cv_max_samples is None:
+            cap = len(y)
+        else:
+            cap = _positive_integer(self.cv_max_samples, "cv_max_samples", folds)
+
         total = min(len(y), cap) // folds * folds
 
-        if total < folds:
-            raise ValueError("Too few participants for CV.")
+        assert total >= folds
 
         sampled = _subsample_indices(y, total, np.random.RandomState(self.random_state),
                                     stratify=self.family == "binomial", min_per_class=folds)
@@ -349,8 +349,13 @@ class MultiPRS:
 
         splitter_type = StratifiedKFold if self.family == "binomial" else KFold
         splitter = splitter_type(n_splits=folds, shuffle=True, random_state=self.random_state)
-        results = [{"candidate": float(value), "l1_ratio": float(ratio), "fold_scores": []}
-                   for ratio in ratios for value in candidates]
+        results = []
+
+        # Keeps each L1 ratio's penalty candidates together for the warm-start sequence.
+        for ratio in ratios:
+            for value in candidates:
+                results.append({"candidate": float(value), "l1_ratio": float(ratio), "fold_scores": []})
+
         metric_type = NagelkerkeR2 if self.family == "binomial" else IncrementalR2
 
         logging.getLogger(__name__).info("Baseline CV: N=%s, folds=%s, candidates=%s", total, folds, len(results))
@@ -359,13 +364,16 @@ class MultiPRS:
             train, validation = sampled[train], sampled[validation]
 
             # Freezes this fold's training means and SDs before transforming validation scores.
-            scaler = _SourceScaler.fit(sources[train])
-            S_train, S_val = scaler.transform(sources[train]), scaler.transform(sources[validation])
+            scaler = GenomewideScaler.fit(sources[train])
+            S_train = scaler.transform(sources[train])
+            S_val = scaler.transform(sources[validation])
 
             nuisance = np.column_stack((np.ones(len(train)), covariates[train]))
             residuals = _residuals(nuisance, S_train, y[train]) if self.family == "gaussian" else None
-            null_fit = (_binomial_null(nuisance, S_train, y[train])
-                        if self.family == "binomial" and self.variant in ("lasso", "elasticnet") else None)
+            if self.family == "binomial" and self.variant in ("lasso", "elasticnet"):
+                null_fit = _binomial_null(nuisance, S_train, y[train])
+            else:
+                null_fit = None
 
             # Evaluation calibrates the frozen PRS; it does not refit the source weights.
             metric = metric_type(y[validation], covariates[validation])
@@ -385,7 +393,9 @@ class MultiPRS:
                 lambda_ = entry["candidate"] * lambda_max
                 coef, _ = _fit_once(nuisance, S_train, y[train], self.family, self.variant,
                                     lambda_, ratio, initial=initial, residuals=residuals, null_fit=null_fit)
-                entry["fold_scores"].append(float(metric.score(S_val @ coef[nuisance.shape[1]:])))
+                genetic_coefficients = coef[nuisance.shape[1]:]
+                validation_score = S_val @ genetic_coefficients
+                entry["fold_scores"].append(float(metric.score(validation_score)))
                 initial = coef
 
             logging.getLogger(__name__).info("Baseline CV fold %s/%s complete", fold, folds)
@@ -410,7 +420,7 @@ class MultiPRS:
     def alpha_(self):
         return self.coef_[1:1 + len(self.covariate_names_)].copy()
 
-    # Returns one coefficient per standardized genome-wide source.
+    # Returns gamma_k, one coefficient per standardized genome-wide source S_ik.
     @property
     def gamma_(self):
         return self.coef_[1 + len(self.covariate_names_):].copy()
@@ -420,7 +430,7 @@ class MultiPRS:
     def method_name_(self):
         return "MultiPRS" if self.variant == "unregularized" else f"MultiPRS-{self.variant}"
 
-    # Computes genetic-only scores using saved source scaling and coefficients.
+    # Computes s_i = sum_k gamma_k S_ik using saved training mu_k and sigma_k.
     def predict_prs(self, data):
         sources, _, _ = self._arrays(data)
 
@@ -429,20 +439,20 @@ class MultiPRS:
 
         return self.scaler_.transform(sources) @ self.gamma_
 
-    # Adds the fitted raw-covariate contribution and intercept to the genetic score.
+    # Computes ell_i = alpha_0 + sum_c alpha_c C_ic + s_i; covariates stay in supplied units.
     def predict_linear(self, data):
         if data.covariate_names != self.covariate_names_:
             raise ValueError("Covariate names/order differ from training.")
 
         return self.alpha_0_ + data.covariates @ self.alpha_ + self.predict_prs(data)
 
-    # Converts the fitted full logistic predictor to event probabilities.
+    # Computes P(y_i=1) = sigmoid(ell_i) for binary models.
     def predict_proba(self, data):
         assert self.family == "binomial"
 
         return expit(self.predict_linear(data))
 
-    # Evaluates the frozen genetic score with the same metric used by BLocPRS.
+    # Evaluates frozen s_i with the same metric used by BLocPRS.
     def score(self, data):
         if data.covariate_names != self.covariate_names_:
             raise ValueError("Evaluation covariate names/order differ from training.")
@@ -508,7 +518,7 @@ class MultiPRS:
                 or not all(np.isfinite(value).all() for value in (model.coef_, mean, sd))):
                 raise ValueError("Invalid saved baseline coefficients or source scaling.")
 
-            model.scaler_ = _SourceScaler(mean, sd)
+            model.scaler_ = GenomewideScaler(mean, sd)
             model.selected_candidate_ = metadata["selected_candidate"]
             model.selected_lambda_ = metadata["selected_lambda"]
             model.selected_l1_ratio_ = metadata["selected_l1_ratio"]

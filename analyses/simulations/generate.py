@@ -146,11 +146,13 @@ def simulate_outcomes(train_genetic, test_genetic, family, seed=20260722, replic
         return train_y, test_y, float(noise_sd), 0.0
 
     # Intercept calibration targets a 10% mean training event probability; sampled prevalence can differ.
-    prevalence = lambda intercept: np.mean(expit(intercept + train_genetic)) - .10
+    def prevalence(intercept):
+        return np.mean(expit(intercept + train_genetic)) - .10
 
     # These intercept endpoints put all training probabilities near zero or one.
-    intercept = bisect(prevalence, -float(np.max(train_genetic)) - 40,
-                       -float(np.min(train_genetic)) + 40, xtol=1e-12)
+    lower_intercept = -float(np.max(train_genetic)) - 40
+    upper_intercept = -float(np.min(train_genetic)) + 40
+    intercept = bisect(prevalence, lower_intercept, upper_intercept, xtol=1e-12)
     train_y = train_rng.binomial(1, expit(intercept + train_genetic))
     test_y = test_rng.binomial(1, expit(intercept + test_genetic))
 

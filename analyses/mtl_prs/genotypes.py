@@ -94,8 +94,10 @@ class PgenDosages:
     # Pgenlib receives sorted sample subsets; returned dosages follow the caller's original order.
     def read(self, variant_indices, sample_indices=None):
         variants = np.asarray(variant_indices, dtype=np.int64)
-        samples = (np.arange(self.n_samples) if sample_indices is None
-                   else np.asarray(sample_indices, dtype=np.int64))
+        if sample_indices is None:
+            samples = np.arange(self.n_samples)
+        else:
+            samples = np.asarray(sample_indices, dtype=np.int64)
 
         if variants.ndim != 1 or np.any((variants < 0) | (variants >= self.n_variants)):
             raise IndexError("Variant indices are outside the PVAR range")
@@ -122,7 +124,9 @@ class PgenDosages:
         # Pgenlib's missing-dosage sentinel becomes NaN for later mean imputation.
         dosage[dosage < -8.0] = np.nan
 
-        return np.ascontiguousarray(dosage.T[np.argsort(order)])
+        # Restores the requested participant order after Pgenlib's sorted read.
+        restore_order = np.argsort(order)
+        return np.ascontiguousarray(dosage.T[restore_order])
 
     # Closing releases the native reader exactly once.
     def close(self):

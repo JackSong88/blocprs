@@ -36,7 +36,9 @@ case "$cohort" in
   *) echo "Cohort must be UKB or CaG." >&2; exit 2 ;;
 esac
 
-output="data/canonical/${sampleset}_scores"
+# Uses supplied frequency/output paths, or the standard cohort directories.
+frequencies="${READ_FREQ_FILE:-$frequencies}"
+output="${OUTDIR:-data/canonical/${sampleset}_scores}"
 mkdir -p "$output"
 
 for score in "$@"; do

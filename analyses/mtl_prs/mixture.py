@@ -98,8 +98,8 @@ def _gaussian_scores(train_y, train_scores, train_c, valid_y, valid_scores, vali
         raise ValueError("Gaussian mixture CV requires positive covariate-only validation error")
 
     # Validation SSE uses the training-fitted coefficients without refitting.
-    full_sse = (covariate_sse - 2 * score_coef * (grid @ valid_cross)
-                + score_coef**2 * np.einsum("ij,jk,ik->i", grid, valid_gram, grid, optimize=True))
+    full_sse = covariate_sse - 2 * score_coef * (grid @ valid_cross)
+    full_sse = full_sse + score_coef**2 * np.einsum("ij,jk,ik->i", grid, valid_gram, grid, optimize=True)
 
     return 1 - full_sse / covariate_sse
 
@@ -129,17 +129,18 @@ def _binary_scores(train_y, train_scores, train_c, valid_y, valid_scores, valid_
 def select_mixture(y, scores, covariates, source_names, *, family="gaussian", folds=5, step=.05, seed=42):
     y = np.asarray(y, dtype=float)
     scores = np.asarray(scores, dtype=float)
-    covariates = np.empty((len(y), 0)) if covariates is None else np.asarray(covariates, dtype=float)
+    if covariates is None:
+        covariates = np.empty((len(y), 0))
+    else:
+        covariates = np.asarray(covariates, dtype=float)
+
     source_names = tuple(map(str, source_names))
 
     if covariates.ndim == 1:
         covariates = covariates[:, None]
 
-    if y.ndim != 1 or scores.ndim != 2 or covariates.ndim != 2:
-        raise ValueError("Provide an outcome vector and participant-by-column score/covariate arrays")
-
-    if scores.shape[0] != len(y) or covariates.shape[0] != len(y):
-        raise ValueError("Outcomes, scores and covariates must contain the same participants")
+    assert y.ndim == 1 and scores.ndim == 2 and covariates.ndim == 2
+    assert scores.shape[0] == len(y) and covariates.shape[0] == len(y)
 
     if len(source_names) != scores.shape[1] or len(set(source_names)) != len(source_names):
         raise ValueError("Provide one unique name per source score")
@@ -194,7 +195,9 @@ def select_mixture(y, scores, covariates, source_names, *, family="gaussian", fo
 
     candidates["mean_metric"] = mean_metric
     candidates["selected"] = np.arange(len(grid)) == best
-    candidates["cv_metric"] = ("heldout_nagelkerke_incremental_r2" if family == "binomial"
-                               else "heldout_1_minus_full_mse_over_covariate_mse")
+    if family == "binomial":
+        candidates["cv_metric"] = "heldout_nagelkerke_incremental_r2"
+    else:
+        candidates["cv_metric"] = "heldout_1_minus_full_mse_over_covariate_mse"
 
     return grid[best].copy(), candidates

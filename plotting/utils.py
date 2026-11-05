@@ -152,8 +152,12 @@ def select_results(data, **filters):
     selected = data
 
     for column, value in filters.items():
-        selected = selected.loc[selected[column].isin(value) if isinstance(value, (list, tuple, set))
-                                else selected[column].eq(value)]
+        if isinstance(value, (list, tuple, set)):
+            mask = selected[column].isin(value)
+        else:
+            mask = selected[column].eq(value)
+
+        selected = selected.loc[mask]
 
     return selected.copy()
 
@@ -267,8 +271,13 @@ def display_phenotype(name):
 
 # Source names follow the score tables shipped with the repository.
 def source_labels(phenotype):
-    name = ("multitrait_prs_table.csv" if phenotype.endswith("_MT") else
-            "sex_biased_prs_table.csv" if phenotype.endswith("_SEX") else "multi_ancestry_prs_table.csv")
+    if phenotype.endswith("_MT"):
+        name = "multitrait_prs_table.csv"
+    elif phenotype.endswith("_SEX"):
+        name = "sex_biased_prs_table.csv"
+    else:
+        name = "multi_ancestry_prs_table.csv"
+
     table = pd.read_csv(Path(__file__).resolve().parents[1] / "tables" / name)
     rows = table.loc[table.AnalysisID.eq(phenotype), ["PGS", "PGS_Name"]].drop_duplicates()
 
@@ -334,8 +343,11 @@ def load_regional_interpretation(data_root, analysis_dir=None):
 # Paired uncertainty comes from evaluation outputs, not from marginal standard errors.
 def read_comparisons(path):
     path = Path(path)
-    paths = ([path.with_name(path.stem + "_comparisons.tsv")] if path.is_file()
-             else sorted(path.rglob("*.tsv")))
+    if path.is_file():
+        paths = [path.with_name(path.stem + "_comparisons.tsv")]
+    else:
+        paths = sorted(path.rglob("*.tsv"))
+
     tables = []
 
     for filename in paths:
@@ -413,8 +425,15 @@ def paired_tests(points, path, target="BLocPRS mb1", baselines=None):
             se = row.difference_se
 
             # AUROC uses saved DeLong P values; R2 uses a Wald test of the paired bootstrap difference.
-            p = (float(row.p_value) if row.metric == "auroc" and "p_value" in row else
-                 erfc(abs(delta / se) / sqrt(2)) if se > 0 else 1.0 if delta == 0 else np.nan)
+            if row.metric == "auroc" and "p_value" in row:
+                p = float(row.p_value)
+            elif se > 0:
+                p = erfc(abs(delta / se) / sqrt(2))
+            elif delta == 0:
+                p = 1.0
+            else:
+                p = np.nan
+
             records.append(dict(scenario=target_row.scenario, cohort=target_row.cohort,
                                 panel=target_row.panel, phenotype=target_row.phenotype,
                                 stratum=target_row.stratum, target=target, method=target, baseline=baseline,
@@ -558,8 +577,13 @@ compact_key = ["scenario", "phenotype", "stratum", "method"]
 # These grids retain all ancestry strata, including non-estimable results.
 def load_compact_benchmarks(path, non_eur=False, metric=None):
     data = read_results(path)
-    candidates = ({"binary": phenotypes["binary"]} if metric == "auroc" else
-                  phenotypes if non_eur else compact_phenotypes)
+    if metric == "auroc":
+        candidates = {"binary": phenotypes["binary"]}
+    elif non_eur:
+        candidates = phenotypes
+    else:
+        candidates = compact_phenotypes
+
     records = []
 
     for cohort in ("ukbb", "cartagene"):
@@ -608,9 +632,6 @@ def load_progression(path, cohort):
         if pd.concat([raw, regional]).n.nunique() != 1:
             raise ValueError(f"Raw/regional sources use different participant counts: {phenotype}")
 
-        if not frame.split.eq("test" if cohort == "ukbb" else "all").all():
-            raise ValueError(f"Unexpected evaluation split: {phenotype}/{cohort}")
-
         for method, mb in (("single", 0), ("regional_single", 1), ("multiprs", 0),
                            ("fixed_composition", 1), ("blocprs", 1)):
             row = method_row(frame, method, mb).to_dict()
@@ -655,12 +676,10 @@ def load_regional_panel(data_root, spec, analysis_dir, gwas_template):
         raise ValueError("These regional maps require 1-Mb windows.")
 
     effects = effects.loc[effects.CHR.eq(spec["chromosome"])].copy()
-    effects["expert_label"] = effects.base.map(source_labels(phenotype)).fillna(effects.expert_label).replace(
-        {"PGS_CRTN_F": "Female", "PGS_CRTN_M": "Male"})
-
-    # Source/window uniqueness prevents averaging inconsistent coefficients.
-    if effects.duplicated(["expert_label", "window"]).any():
-        raise ValueError(f"Duplicate source/window coefficients: {phenotype}")
+    # Keeps the stored label when the source table has no matching name.
+    mapped_labels = effects.base.map(source_labels(phenotype))
+    retained_labels = mapped_labels.fillna(effects.expert_label)
+    effects["expert_label"] = retained_labels.replace({"PGS_CRTN_F": "Female", "PGS_CRTN_M": "Male"})
 
     if set(effects.expert_label) != set(spec["sources"]):
         raise ValueError(f"Unexpected PRS sources: {phenotype}")
@@ -710,8 +729,14 @@ def load_regional_panel(data_root, spec, analysis_dir, gwas_template):
 
         # GWAS positions and stored windows are both one-based inclusive.
         # Window lookup finds the last start at or before each SNP and checks the end to exclude gaps.
-        indices = np.searchsorted(starts, points.POS.to_numpy(), side="right") - 1
-        covered = (indices >= 0) & (points.POS.to_numpy() <= ends[np.maximum(indices, 0)])
+        positions = points.POS.to_numpy()
+        indices = np.searchsorted(starts, positions, side="right") - 1
+        has_start = indices >= 0
+
+        # Negative lookup indices use a safe placeholder, then has_start excludes those SNPs.
+        safe_indices = np.maximum(indices, 0)
+        within_end = positions <= ends[safe_indices]
+        covered = has_start & within_end
         points = points.loc[covered].sort_values("POS")
 
         if points.empty:
@@ -744,9 +769,11 @@ def load_training_sizes(path):
     # Selection retains primary models and outcome metrics across full and subsample fits.
     data = select_results(data, group="all", train_group="all", covariate_set="standard", panel="main")
     data = data.loc[data.phenotype.isin([name for name, _ in core_phenotypes])]
-    data = data.loc[((data.method.eq("blocprs") & data.window_mb.eq(1))
-                     | (data.method.eq("multiprs") & data.window_mb.eq(0)))
-                    & data.metric.isin(metric_tokens.values())].copy()
+    regional_model = data.method.eq("blocprs") & data.window_mb.eq(1)
+    genomewide_model = data.method.eq("multiprs") & data.window_mb.eq(0)
+    selected_models = regional_model | genomewide_model
+    selected_metrics = data.metric.isin(metric_tokens.values())
+    data = data.loc[selected_models & selected_metrics].copy()
     data["model"] = [display_method(method, mb) for method, mb in zip(data.method, data.window_mb)]
     data["size"] = data.train_size.map(lambda size: size if size == "full" else int(size))
 

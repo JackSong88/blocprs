@@ -70,10 +70,16 @@ def build_figure(data):
     fig.subplots_adjust(left=.09, right=.985, bottom=.13, top=.815, wspace=.38, hspace=.32)
     recovery = data[[method + "_recovery_pct" for method in methods[1:3]]].to_numpy().ravel()
     recovery = recovery[np.isfinite(recovery)]
-    recovery_limits = ((10*floor(min(0, recovery.min()-3)/10), 10*ceil(max(105, recovery.max()+5)/10))
-                       if len(recovery) else (-10, 110))
+    if len(recovery):
+        recovery_limits = (10*floor(min(0, recovery.min()-3)/10), 10*ceil(max(105, recovery.max()+5)/10))
+    else:
+        recovery_limits = (-10, 110)
+
     correlation = data.loc[data.architecture.ne("A0"), correlation_column].dropna()
-    correlation_min = min(0, .1*floor((correlation.min()-.03)/.1)) if len(correlation) else 0
+    if len(correlation):
+        correlation_min = min(0, .1*floor((correlation.min()-.03)/.1))
+    else:
+        correlation_min = 0
 
     for row, (panel, spec) in enumerate(panels.items()):
         selected = data.loc[data.panel.eq(panel)]

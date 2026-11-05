@@ -1,8 +1,15 @@
 #!/bin/bash
 
+#SBATCH --job-name=blocprs_scorefiles
+#SBATCH --account=def-liyue
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
+#SBATCH --time=03:00:00
+#SBATCH --output=log/window_scorefiles_%j.log
+
 set -euo pipefail
 
-# Uses repository-relative paths and canonical mapping outputs; expects a compute allocation.
+# Prepares windowed and genome-wide weights using repository-relative paths.
 source env/blocprs/bin/activate
 scripts=data_preparation/4_prepare_window_scores/4.2_window_scorefiles
 
@@ -18,10 +25,10 @@ mkdir -p data/canonical/assigned
 for chromosome in {1..22}; do
 
     # Adds the same window assignment to each variant's UKB and CaG matches.
-    # Writes the assigned tables used later by SNP-weight export.
+    # Writes the assigned tables used later by variant-weight export.
     python "$scripts/assign_canonical_windows_chr.py" \
         --chromosome "$chromosome" \
-        --shared-crosswalk "data/canonical/cross_mapping_chr${chromosome}.tsv.gz" \
+        --shared-crosswalk "data/canonical_mapping/crosswalks/cross_mapping_chr${chromosome}.tsv.gz" \
         --windows tables/windows_GRCh37_1Mb.tsv \
         --out "data/canonical/assigned/cross_mapping_chr${chromosome}.tsv.gz"
 

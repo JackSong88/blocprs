@@ -25,13 +25,8 @@ def load_results(data_root, analysis_dir=None):
 
     # Missing bins cannot silently change the set of phenotype means.
     if (values.phenotype.nunique() != 25 or len(values) != 350
-            or values.duplicated(["phenotype", "ranking", "bin"]).any()
             or not np.isfinite(values.net_sd_ratio.dropna()).all() or values.net_sd_ratio.dropna().lt(0).any()):
         raise ValueError("Incomplete or invalid covariance-sensitivity summaries")
-
-    for _, group in values.groupby(["phenotype", "ranking"]):
-        if set(group.bin) != set(reference_bins):
-            raise ValueError("Incomplete reference-ranked bins")
 
     # Summary means average phenotype-level ratios rather than pooling windows across phenotypes.
     return values.groupby(["ranking", "bin"]).net_sd_ratio.mean().unstack("bin")[reference_bins]

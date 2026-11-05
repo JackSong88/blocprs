@@ -32,8 +32,11 @@ def profile_figures(means, ratios):
             sources = ordered_sources(selected.expert_label.unique())
             target = target_source(phenotype, sources) if name == "related_traits" else None
             related = [source for source in sources if source != target]
-            source_colors = colors if target is None else {
-                target: "#333333", **dict(zip(related, ["#0072B2", "#D55E00", "#009E73", "#AA6BA5"]))}
+            if target is None:
+                source_colors = colors
+            else:
+                source_colors = {target: "#333333",
+                                 **dict(zip(related, ["#0072B2", "#D55E00", "#009E73", "#AA6BA5"]))}
 
             if len(batch) % 2 and index == len(batch)-1:
                 block = .5
@@ -44,7 +47,8 @@ def profile_figures(means, ratios):
             empty_bins = [i for i, label in enumerate(reference_bins) if not selected.bin.astype(str).eq(label).any()]
 
             # A phenotype's three components share the same contribution scale.
-            low, high = selected[["reference", "adjustment", "effective"]].to_numpy().min(), selected[["reference", "adjustment", "effective"]].to_numpy().max()
+            component_values = selected[["reference", "adjustment", "effective"]].to_numpy()
+            low, high = component_values.min(), component_values.max()
             span = max(high-low, .0001)
 
             for column, (component, heading) in enumerate((("effective", "Full BLocPRS"),
@@ -52,7 +56,9 @@ def profile_figures(means, ratios):
                 ax = fig.add_axes([(left+27*column)/183, top-22/height, 25/183, 22/height])
 
                 for source in sources:
-                    values = selected.loc[selected.expert_label.eq(source)].set_index("bin").reindex(reference_bins)[component]
+                    source_rows = selected.loc[selected.expert_label.eq(source)]
+                    binned_source = source_rows.set_index("bin").reindex(reference_bins)
+                    values = binned_source[component]
                     ax.plot(range(7), values, color=source_colors[source], marker="o", ms=1.7,
                             lw=.9 if source == target else .65, zorder=4 if source == target else 3)
 

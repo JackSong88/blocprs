@@ -1,6 +1,15 @@
 # Adapts MoEPRS for BLocPRS: https://github.com/shz9/moe-prs-paper
 
-"""Aligns PRSs and clinical records by participant ID, applies saved splits and saves arrays."""
+"""Builds modelling datasets by matching extracted scores and clinical records by FID/IID.
+
+Keeps participants with scores and complete phenotype/covariate records. Uses
+saved training-then-test order, or eligible input order for transfer evaluation.
+
+Writes scores.npy and covariates.npy with the same participant rows as
+participants.tsv, which also stores phenotype, ancestry and split labels.
+features.tsv labels window/PRS pairs; covariates.tsv lists covariate names only.
+The extracted inputs are unchanged; scores are not fitted or standardized here.
+"""
 
 import argparse
 import logging
@@ -12,30 +21,31 @@ from time import monotonic
 
 import numpy as np
 import pandas as pd
-from blocprs.selection import read_ids
+from participant_utils import read_ids
 
-from dataset_utils import ScoreTable, participant_index, read_metadata, feature_layout, match_score_participants
+from dataset_utils import ScoreTable, read_metadata, feature_layout, match_score_participants
 
 logger = logging.getLogger(__name__)
 
 
+# Reads FID/IID pairs, or IIDs alone, in their saved order.
 def read_split_ids(path):
     table = read_ids(path)
-    keys = table.iloc[:, 0].tolist() if table.shape[1] == 1 else list(table.itertuples(index=False, name=None))
+    if table.shape[1] == 1:
+        keys = table.iloc[:, 0].tolist()
+    else:
+        keys = list(table.itertuples(index=False, name=None))
 
     return keys, table.shape[1]
 
 
-# Uses the saved training/test order, or keeps all eligible transfer participants.
+# Orders participants by saved train/test IDs, or labels all eligible transfer rows.
 def assign_splits(metadata, family, train_ids_file=None, test_ids_file=None, all_participants=False):
 
-    if (train_ids_file is None) != (test_ids_file is None):
-        raise ValueError("Supply both train and test ID files together.")
+    assert (train_ids_file is None) == (test_ids_file is None), "Provide both train and test ID files."
+    assert not all_participants or train_ids_file is None, "Choose split files or all participants, not both."
 
-    if all_participants and train_ids_file is not None:
-        raise ValueError("Choose saved split files or all participants, not both.")
-
-    # Keeps all eligible transfer participants without a new split.
+    # Preserves eligible score-file order and labels every participant as all.
     if all_participants:
         result = metadata.copy()
         result["split"] = "all"
@@ -48,7 +58,10 @@ def assign_splits(metadata, family, train_ids_file=None, test_ids_file=None, all
     if train_width != test_width or not set(train_ids).isdisjoint(test_ids):
         raise ValueError("Train/test files must use the same ID format and have no overlap.")
 
-    index = metadata.index if train_width == 2 else pd.Index(metadata.index.get_level_values("IID"))
+    if train_width == 2:
+        index = metadata.index
+    else:
+        index = pd.Index(metadata.index.get_level_values("IID"))
 
     if index.has_duplicates:
         raise ValueError("IIDs are not unique; supply two-column FID/IID split files.")
@@ -66,17 +79,21 @@ def assign_splits(metadata, family, train_ids_file=None, test_ids_file=None, all
     if family == "binomial" and set(metadata.iloc[train_rows]["phenotype"]) != {0, 1}:
         raise ValueError("Binary training data must contain both cases and controls.")
 
+    # Places training rows before test rows, preserving each ID file's order.
     result = metadata.iloc[np.concatenate([train_rows, test_rows])].copy()
     result["split"] = ["train"] * len(train_rows) + ["test"] * len(test_rows)
 
     return result
 
 
-# Reads feature blocks and reorders them into participant rows.
+# Reads adjacent window/PRS columns from disk, then selects participants by ID.
+# Writes scores in the same participant order as phenotypes and covariates.
 def write_feature_ordered_scores(table, metadata, features, output_dir):
     columns = features["column"].tolist()
     column_positions = {name: index for index, name in enumerate(columns)}
-    rows = participant_index(table.ids, "Scores").get_indexer(metadata.index)
+
+    # Finds each selected participant's row in the extracted score array.
+    rows = pd.MultiIndex.from_frame(table.ids).get_indexer(metadata.index)
 
     if (rows < 0).any():
         raise ValueError("Selected participants are absent from the input scores.")
@@ -91,6 +108,7 @@ def write_feature_ordered_scores(table, metadata, features, output_dir):
         logger.info("Reordering scores in temporary storage: N=%s, features=%s",
                     len(metadata), len(columns))
 
+        # Creates a normal .npy file through a writable memory map for blockwise assembly.
         scores = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
         matrix = scores.reshape(len(metadata), -1)
 
@@ -123,7 +141,8 @@ def write_feature_ordered_scores(table, metadata, features, output_dir):
     logger.info("Score writing complete: elapsed=%.1fs", monotonic() - started)
 
 
-# Chooses feature-wise or row-wise reads to match the input array layout.
+# Chooses a reading strategy for the input's storage layout. Both paths write
+# the selected participant order and the window/PRS order specified by features.
 def write_arrays(table, metadata, features, covariate_names, output_dir):
     n_windows = features["window"].nunique()
 
@@ -141,10 +160,12 @@ def write_arrays(table, metadata, features, covariate_names, output_dir):
     np.save(output_dir / "covariates.npy", covariates, allow_pickle=False)
     metadata[["phenotype", "Ancestry", "split"]].reset_index().to_csv(output_dir / "participants.tsv", sep="\t", index=False)
     features.to_csv(output_dir / "features.tsv", sep="\t", index=False)
+
+    # Records covariate column names; their values are stored in covariates.npy.
     pd.DataFrame({"covariate": covariate_names}).to_csv(output_dir / "covariates.tsv", sep="\t", index=False)
 
 
-# Reads small participant blocks when scores are already stored in that order.
+# Reads participant blocks and maps their IDs to the selected output rows.
 def write_row_ordered_scores(table, metadata, features, output_dir):
     columns = features["column"].tolist()
     n_windows, n_sources = features["window"].nunique(), features["source"].nunique()
@@ -158,18 +179,15 @@ def write_row_ordered_scores(table, metadata, features, output_dir):
 
     try:
         for block, (chunk_ids, values) in enumerate(chunks, start=1):
-            ids = participant_index(chunk_ids, "Scores")
+            ids = pd.MultiIndex.from_frame(chunk_ids)
 
             if not np.isfinite(values).all():
                 raise ValueError("Scores must be finite and representable as float32.")
 
-            # Maps streamed rows into the saved train/test order, not score-file order.
+            # Matches each input FID/IID pair to its row in the aligned dataset.
             positions = metadata.index.get_indexer(ids)
             keep = positions >= 0
             selected = positions[keep]
-
-            if written[selected].any():
-                raise ValueError("Repeated score participants encountered during array writing.")
 
             scores[selected] = values[keep].reshape(-1, n_windows, n_sources)
             written[selected] = True
@@ -185,7 +203,7 @@ def write_row_ordered_scores(table, metadata, features, output_dir):
                 scores.flush()
 
         if not written.all():
-            raise ValueError("The score file changed between ID selection and score writing.")
+            raise ValueError("Scores were not written for every selected participant.")
 
         scores.flush()
 
@@ -195,14 +213,14 @@ def write_row_ordered_scores(table, metadata, features, output_dir):
     logger.info("Score writing complete: elapsed=%.1fs", monotonic() - started)
 
 
+# Aligns one extracted score bundle with clinical records and saves a new dataset.
 def create_datasets(scores_file, phenotype_file, covariates_file, ancestry_file, output_dir, family,
                     num_pcs=10, train_ids_file=None, test_ids_file=None, all_participants=False):
 
     assert family in ("gaussian", "binomial")
     assert num_pcs >= 0
 
-    if not all_participants and (train_ids_file is None or test_ids_file is None):
-        raise ValueError("Supply train/test ID files from create_splits.py, or use --all-participants for transfer data.")
+    assert all_participants or (train_ids_file is not None and test_ids_file is not None), "Provide train/test IDs or use --all-participants."
 
     output_dir = Path(output_dir)
 
@@ -212,13 +230,13 @@ def create_datasets(scores_file, phenotype_file, covariates_file, ancestry_file,
     started = monotonic()
     logger.info("Preparing dataset: scores=%s; family=%s", scores_file, family)
 
-    # Aligns clinical records with the available score participants.
+    # Matches FID/IID pairs with scores and complete phenotype/covariate records.
     table = ScoreTable(scores_file)
     features = feature_layout(table)
     metadata, covariate_names = read_metadata(phenotype_file, covariates_file, ancestry_file, num_pcs, family)
     metadata, score_count, missing_scores = match_score_participants(table, metadata)
 
-    # Reuses the same participant membership and order for every score representation.
+    # Applies saved train-then-test order, or keeps eligible input order for transfer.
     metadata = assign_splits(metadata, family, train_ids_file, test_ids_file, all_participants)
 
     logger.info("Selected N=%s; splits=%s; windows=%s; sources=%s", len(metadata),
@@ -269,7 +287,7 @@ def main():
 
     try:
         result = create_datasets(**vars(args))
-    except (OSError, ValueError) as error:
+    except (AssertionError, OSError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
 
     print(f"Saved {result['participants']} participants to {args.output_dir}; split counts: {result['splits']}.", flush=True)

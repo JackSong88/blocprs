@@ -27,13 +27,14 @@ logger = logging.getLogger(__name__)
 class BLocPRS:
     """Joint estimation of genome-wide and regional PRS coefficients.
 
-    Ridge regularization acts on regional adjustments; the intercept,
-    covariate effects and genome-wide source coefficients remain unpenalized.
+    Ridge regularization acts on eta_wk; alpha_0, alpha_c and gamma_k remain
+    unpenalized. The full predictor is ell_i = alpha_0 + sum_c alpha_c C_ic
+    + sum_k gamma_k S_ik + sum_wk eta_wk Z_iwk.
 
     ``family`` is ``"gaussian"`` or ``"binomial"``. A fixed ``lambda_`` skips
     CV; otherwise select from ``lambda_grid`` (25 logarithmically spaced values
     from 1e-3 to 1e3 by default).
-    CV evaluates fixed genetic scores using incremental R^2 for continuous
+    CV evaluates fixed genetic scores s_i using incremental R^2 for continuous
     phenotypes or covariate-conditioned Nagelkerke R^2 for binary phenotypes.
     CV learns means and SDs separately on each fold's training rows.
     ``cv_workers`` runs independent folds in separate, single-threaded processes.
@@ -66,17 +67,17 @@ class BLocPRS:
 
     # Selects the penalty and fits using training participants only.
     def fit(self, data):
-        if not isinstance(data, PRSData) or data.y is None:
-            raise ValueError("fit requires PRSData with an outcome vector.")
+        assert isinstance(data, PRSData) and data.y is not None
 
         if self.lambda_ is not None:
-            if not np.isfinite(self.lambda_) or self.lambda_ < 0:
-                raise ValueError("lambda_ must be finite and nonnegative.")
+            assert np.isfinite(self.lambda_) and self.lambda_ >= 0
 
             assert self.lambda_grid is None
 
-        grid = (np.logspace(-3, 3, 25) if self.lambda_grid is None
-                else np.asarray(self.lambda_grid, dtype=float))
+        if self.lambda_grid is None:
+            grid = np.logspace(-3, 3, 25)
+        else:
+            grid = np.asarray(self.lambda_grid, dtype=float)
 
         if self.lambda_ is None:
             selected_lambda, cv_results = select_lambda(data, self.family, grid,
@@ -132,8 +133,7 @@ class BLocPRS:
 
     # Stops if coefficients have not been fitted or loaded.
     def _require_fitted(self):
-        if not hasattr(self, "coef_"):
-            raise ValueError("Fit or load a BLocPRS model before using it.")
+        assert hasattr(self, "coef_"), "Fit or load the model first."
 
     # Returns alpha_0, the fitted intercept.
     @property
@@ -141,20 +141,20 @@ class BLocPRS:
         self._require_fitted()
         return float(self.coef_[0])
 
-    # Returns alpha, the coefficients of the transformed covariates.
+    # Returns alpha_c, one coefficient per transformed covariate C_ic.
     @property
     def alpha_(self):
         self._require_fitted()
         return self.coef_[1 : 1 + len(self.covariate_names_)].copy()
 
-    # Returns gamma, one global coefficient per source.
+    # Returns gamma_k, one coefficient per standardized genome-wide source S_ik.
     @property
     def gamma_(self):
         self._require_fitted()
         start = 1 + len(self.covariate_names_)
         return self.coef_[start : start + len(self.source_names_)].copy()
 
-    # Returns eta, the regional coefficients in W x K order.
+    # Returns eta_wk as a W x K array: eta_[w, k] is one regional coefficient.
     @property
     def eta_(self):
         self._require_fitted()
@@ -163,15 +163,15 @@ class BLocPRS:
 
         return self.coef_[start:].reshape(shape).copy()
 
-    # Centers eta by removing each source's mean regional coefficient.
+    # Returns eta_centered_wk = eta_wk - mean_w(eta_wk), separately for each source.
     @property
     def eta_centered_(self):
         eta = self.eta_
 
-        # Centering coefficients here is equivalent to using the centered window design Z.
+        # sum_w eta_wk Z_iwk = sum_w eta_centered_wk S_iwk for each source.
         return eta - eta.mean(axis=0, keepdims=True)
 
-    # Returns c_eff = gamma + eta_centered in window/source order.
+    # Returns c_eff_wk = gamma_k + eta_centered_wk in window/source order.
     @property
     def c_eff_(self):
         return self.gamma_[None, :] + self.eta_centered_
@@ -201,7 +201,7 @@ class BLocPRS:
 
             return values
 
-        # Manuscript eq:blocprs: ell = alpha_0 + C @ alpha + genetic score.
+        # ell_i = alpha_0 + sum_c alpha_c C_ic + s_i, in the model's fitted units.
         design = Design(data, self.scaler_, block_size=self.block_size)
         values = np.empty(design.n_samples, dtype=np.float64)
         cursor = 0
@@ -216,15 +216,15 @@ class BLocPRS:
 
         return values
 
-    # Computes the genetic score without covariates, intercept or sigmoid.
+    # Computes s_i without covariates, intercept or sigmoid.
     def predict_prs(self, data):
         return self._predict(data, genetic_only=True)
 
-    # Computes full ell: intercept + covariates + genetics, in model units.
+    # Computes full ell_i: intercept + covariates + s_i, in model units.
     def predict_linear(self, data):
         return self._predict(data, genetic_only=False)
 
-    # Converts the full binary predictor to P(y=1) for each participant.
+    # Converts full ell_i to P(y_i=1) with the sigmoid for binary models.
     def predict_proba(self, data):
         assert self.family == "binomial"
 
@@ -234,13 +234,12 @@ class BLocPRS:
     def score(self, data):
         self._require_fitted()
 
-        if data.y is None:
-            raise ValueError("Evaluation requires outcomes.")
+        assert data.y is not None
 
         if data.covariate_names != self.covariate_names_:
             raise ValueError("Evaluation requires the fitted covariate names and order.")
 
-        # Evaluates the frozen genetic score using the shared CV metric.
+        # Evaluates frozen s_i using the shared CV metric, not full ell_i.
         metric = NagelkerkeR2 if self.family == "binomial" else IncrementalR2
 
         return metric(data.y, data.covariates).score(self.predict_prs(data))

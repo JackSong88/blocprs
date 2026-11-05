@@ -12,19 +12,20 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import pandas as pd
 
-from dataset_utils import ScoreTable, feature_layout, participant_index
+from dataset_utils import ScoreTable, feature_layout
 
 
 # Selects the requested PRSs, requiring the same windows in every input.
 def panel_layout(inputs, selections):
     plans, output_sources = [], []
-    reference_windows = feature_layout(next(iter(inputs.values()))).window.drop_duplicates().tolist()
+    reference_table = next(iter(inputs.values()))
+    reference_features = feature_layout(reference_table)
+    reference_windows = reference_features.window.drop_duplicates().tolist()
 
     for specification in selections:
         parts = specification.split(":")
 
-        if len(parts) not in (2, 3):
-            raise ValueError("Use INPUT:SOURCE or INPUT:SOURCE:OUTPUT_NAME.")
+        assert len(parts) in (2, 3), "Use INPUT:SOURCE[:OUTPUT_NAME]."
 
         name, source = parts[:2]
         alias = parts[2] if len(parts) == 3 else source
@@ -45,16 +46,23 @@ def panel_layout(inputs, selections):
         plans.append((name, selected.column.tolist()))
 
     # Keeps window-major ordering in the output feature labels.
-    rows = [(window, source, source if window == "genomewide" else f"{source}_{window}")
-            for window in reference_windows for source in output_sources]
+    rows = []
+
+    for window in reference_windows:
+        for source in output_sources:
+            if window == "genomewide":
+                column = source
+            else:
+                column = f"{source}_{window}"
+
+            rows.append((window, source, column))
 
     return plans, pd.DataFrame(rows, columns=["window", "source", "column"])
 
 
 # Streams selected score columns into one aligned float32 panel.
 def build_panel(inputs, selections, output_dir):
-    if not inputs or not selections:
-        raise ValueError("Provide at least one input and one selected source.")
+    assert inputs and selections
 
     output_dir = Path(output_dir)
 
@@ -66,7 +74,7 @@ def build_panel(inputs, selections, output_dir):
 
     # Keeps the first input's population even when none of its sources are selected.
     ids = next(iter(tables.values())).ids
-    reference = participant_index(ids, "Reference scores")
+    reference = pd.MultiIndex.from_frame(ids)
     n_windows, n_sources = features.window.nunique(), features.source.nunique()
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -84,28 +92,38 @@ def build_panel(inputs, selections, output_dir):
 
                 print(f"Copying selected control scores from {name}.", flush=True)
 
-                if not reference.isin(participant_index(table.ids, name)).all():
+                if not reference.isin(pd.MultiIndex.from_frame(table.ids)).all():
                     raise ValueError(f"Input {name!r} lacks reference participants; align scores before making controls.")
 
-                columns = list(dict.fromkeys(column for _, names in selected for column in names))
+                # Reads each requested column once, keeping its first-seen order.
+                columns = []
+                seen = set()
+
+                for _, names in selected:
+                    for column in names:
+                        if column not in seen:
+                            columns.append(column)
+                            seen.add(column)
+
                 positions = {column: index for index, column in enumerate(columns)}
                 written = np.zeros(len(ids), dtype=bool)
                 for block_ids, values in table.iter_chunks(columns=columns, dtype=np.float32):
 
                     # Reorder by ID; extra input participants do not enter the reference panel.
-                    rows = reference.get_indexer(participant_index(block_ids, name))
+                    rows = reference.get_indexer(pd.MultiIndex.from_frame(block_ids))
                     keep = rows >= 0
                     rows, values = rows[keep], values[keep]
 
-                    if written[rows].any() or not np.isfinite(values).all():
-                        raise ValueError("Repeated participants or nonfinite scores in a control input.")
+                    if not np.isfinite(values).all():
+                        raise ValueError("Control scores must be finite and representable as float32.")
 
                     for source_index, names in selected:
-                        scores[rows, :, source_index] = values[:, [positions[column] for column in names]]
+                        source_columns = [positions[column] for column in names]
+                        scores[rows, :, source_index] = values[:, source_columns]
                     written[rows] = True
 
                 if not written.all():
-                    raise ValueError(f"Input {name!r} changed between ID inspection and scoring.")
+                    raise ValueError(f"Input {name!r} did not supply scores for every reference participant.")
 
                 scores.flush()
         finally:

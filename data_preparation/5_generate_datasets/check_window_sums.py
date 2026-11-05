@@ -20,8 +20,7 @@ from dataset_utils import ScoreTable
 # Compares aligned raw scores before any training-derived standardization.
 def check_window_sums(windowed, genomewide, atol=1e-4, rtol=1e-6):
 
-    if not np.isfinite([atol, rtol]).all() or min(atol, rtol) < 0:
-        raise ValueError("Tolerances must be finite and nonnegative.")
+    assert np.isfinite([atol, rtol]).all() and min(atol, rtol) >= 0, "Tolerances must be finite and nonnegative."
 
     windows, reference = ScoreTable(windowed), ScoreTable(genomewide)
     features, reference_features = windows.features, reference.features

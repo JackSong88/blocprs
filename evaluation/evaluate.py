@@ -15,7 +15,7 @@ import pandas as pd
 from blocprs import BLocPRS, FixedCompositionBLocPRS, load_dataset, load_model
 from blocprs.data import select_sources
 from blocprs.metrics import IncrementalR2, NagelkerkeR2, NonEstimableError
-from blocprs.selection import read_participants
+from participant_utils import read_participants
 
 if __package__:
     from .bootstrap import bootstrap_metrics, paired_comparisons
@@ -47,7 +47,8 @@ def load_scores(path, sample_ids, columns=None, phenotype=None):
     if columns is None and "phenotype" in table and phenotype is None:
         raise ValueError("The score table contains phenotype metadata; select genetic columns with --score-columns.")
 
-    columns = [name for name in table if name not in ("FID", "IID", "phenotype")] if columns is None else columns
+    if columns is None:
+        columns = [name for name in table if name not in ("FID", "IID", "phenotype")]
 
     if not columns or len(columns) != len(set(columns)) or set(columns) & {"FID", "IID", "phenotype"}:
         raise ValueError("Select distinct genetic score columns, not IDs or phenotype metadata.")
@@ -147,8 +148,7 @@ def group_masks(participants, groups):
                 mask &= participants["Ancestry"].notna().to_numpy() & participants["Ancestry"].ne("EUR").to_numpy()
             else:
 
-                if label not in set(participants["Ancestry"]):
-                    raise ValueError(f"Unknown or absent ancestry group: {label}")
+                assert label in set(participants["Ancestry"]), f"Unknown ancestry group: {label}"
 
                 mask &= participants["Ancestry"].eq(label).to_numpy()
 
@@ -171,15 +171,15 @@ def score_labels(columns, window_mb=0):
         if method in ("blocprs", "fixed_composition", "regional_single", "anchor_only") and mb <= 0:
             raise ValueError(f"Specify the window size for regional score {column!r}.")
 
-        if method in ("single", "regional_single") and not separator:
-            raise ValueError(f"Name source scores as {method}:SOURCE, including the source identifier.")
+        assert method not in ("single", "regional_single") or separator, "Use method:SOURCE for source scores."
 
         rows.append(dict(score=column, method=method, source=source, window_mb=mb))
 
     return pd.DataFrame(rows).set_index("score")
 
 
-# Computes only the fitted genome-wide component, with the same training scaling.
+# Computes the anchor-only score sum_k gamma_k S_ik, where S_ik = sum_w S_iwk.
+# Uses the fitted training means mu_wk and source SDs sigma_k.
 def anchor_scores(model, data):
     values = np.empty(data.n_samples, dtype=float)
 
@@ -276,7 +276,7 @@ def evaluate_groups(data, participants, scores, family, groups, split, metrics,
 
         if "auroc" in metrics:
 
-            # AUROC uses the genetic score directly, without covariate calibration.
+            # AUROC uses each method's fixed s_i directly, without covariate calibration.
             result, paired = evaluate_auroc(selected.y, values, references)
             reason = reporting_reason(selected.y, family)
 
@@ -296,8 +296,14 @@ def evaluate_groups(data, participants, scores, family, groups, split, metrics,
                 paired["group"] = group
                 comparisons.append(paired)
 
-    return pd.concat(points, ignore_index=True), (pd.concat(comparisons, ignore_index=True)
-                                                  if comparisons else pd.DataFrame())
+    point_results = pd.concat(points, ignore_index=True)
+
+    if comparisons:
+        comparison_results = pd.concat(comparisons, ignore_index=True)
+    else:
+        comparison_results = pd.DataFrame()
+
+    return point_results, comparison_results
 
 
 # Loads fixed genetic scores and writes portable point-estimate and comparison tables.
@@ -384,14 +390,16 @@ def main():
 
         family = model.family
 
-        # The PRS excludes covariate effects, the intercept and sigmoid.
+        # The final genetic score s_i excludes covariate effects, the intercept and sigmoid.
         data = select_sources(data, model.source_names_)
 
         if isinstance(model, FixedCompositionBLocPRS):
             name = f"fixed_composition_mb{args.window_mb}"
         elif isinstance(model, BLocPRS):
-            name = (f"regional_single_mb{args.window_mb}:{model.source_names_[0]}"
-                    if len(model.source_names_) == 1 else f"blocprs_mb{args.window_mb}")
+            if len(model.source_names_) == 1:
+                name = f"regional_single_mb{args.window_mb}:{model.source_names_[0]}"
+            else:
+                name = f"blocprs_mb{args.window_mb}"
         elif len(model.source_names_) == 1 and model.variant == "unregularized":
             name = f"calibrated_single:{model.source_names_[0]}"
         else:
@@ -413,6 +421,7 @@ def main():
         if data.window_names != ("genomewide",):
             parser.error("--raw-sources requires a genome-wide dataset, not an inferred sum of windows.")
 
+        # Evaluates each raw source S_tilde_ik as its own fixed scalar score s_i.
         data = select_sources(data, args.source_names or data.source_names)
         scores = pd.DataFrame(np.asarray(data.window_scores[:, 0], dtype=float),
                               columns=[f"single:{source}" for source in data.source_names])
@@ -427,8 +436,8 @@ def main():
 
     if args.extra_covariates:
 
-        # Predictions have already been computed. Extra covariates change only the evaluation
-        # regressions, allowing sensitivity analysis without changing the fitted genetic score.
+        # Scores s_i have already been computed. Extra covariates change only the
+        # evaluation regressions, leaving each fitted genetic score fixed.
         extra = load_scores(args.extra_covariates, data.sample_ids, phenotype=data.y)
 
         if set(extra.columns) & set(data.covariate_names):

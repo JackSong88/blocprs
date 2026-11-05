@@ -34,7 +34,7 @@ def main(argv=None):
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-    # Uses only the stored training split or the requested subset of it.
+    # Loads raw S_tilde_ik for the stored training split or its requested subset.
     logging.info("Loading training dataset: %s", args.dataset)
     data = load_dataset(args.dataset, split="train", ids_file=args.train_ids)
     logging.info("Fitting %s: family=%s, N=%s, sources=%s",
@@ -50,7 +50,7 @@ def main(argv=None):
                          cv_folds=args.cv_folds, cv_max_samples=args.cv_max_samples,
                          random_state=args.seed)
 
-    # Fits the comparator, then saves its coefficients and source scaling.
+    # Fits gamma_k and covariate effects, then saves them with training mu_k and sigma_k.
     model.fit(data)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

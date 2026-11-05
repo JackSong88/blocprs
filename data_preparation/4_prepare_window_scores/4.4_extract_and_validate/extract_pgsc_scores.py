@@ -241,9 +241,14 @@ def write_output(block_paths, groups, sources, windows, ids_frame, output, block
     values_per_chunk = max(1, min(block_size * WINDOWS_PER_BLOCK,
                                   OUTPUT_BUFFER_BYTES // (np.dtype(np.float64).itemsize + dtype.itemsize)))
 
-    features = [("genomewide" if window is None else f"w{window:04d}", source,
-                 source if window is None else f"{source}_w{window:04d}")
-                for window in windows for source in sources]
+    features = []
+
+    for window in windows:
+        for source in sources:
+            if window is None:
+                features.append(("genomewide", source, source))
+            else:
+                features.append((f"w{window:04d}", source, f"{source}_w{window:04d}"))
 
     # Writes the score array and labels together before moving to the final directory.
     with tempfile.TemporaryDirectory(prefix=f".{output.name}.", suffix=".partial", dir=output.parent) as directory:
@@ -382,9 +387,7 @@ def extraction_checkpoint(tmp_dir, work_dir, state, n_blocks, reference_file, bl
 def extract_scores(scorefiles, score_dir, sources, output, block_size=65536, chromosomes=None,
                    tmp_dir=Path("data/tmp/extract_scores"), work_dir=None):
 
-    if len(set(sources)) != len(sources):
-        raise ValueError("Provide unique source names.")
-
+    assert len(set(sources)) == len(sources)
     assert block_size >= 1
 
     if output.exists() or output.is_symlink():
@@ -415,7 +418,11 @@ def extract_scores(scorefiles, score_dir, sources, output, block_size=65536, chr
                 raise ValueError("Window IDs must be genome-wide unique.")
 
     requested = set(sources)
-    available = set().union(*(record.sources for record in results))
+    available = set()
+
+    for record in results:
+        available.update(record.sources)
+
     missing = requested - available
 
     if missing:
@@ -459,7 +466,10 @@ def extract_scores(scorefiles, score_dir, sources, output, block_size=65536, chr
             print(f"Block {index + 1}/{len(groups)}: {'reused' if reused else 'saved'}.", flush=True)
 
         # Checks again because upstream score files can change while extraction runs.
-        if state["inputs"] != [[file_signature(path), file_signature(record.path)] for path, record in zip(scorefiles, results)]:
+        current_inputs = [[file_signature(path), file_signature(record.path)]
+                          for path, record in zip(scorefiles, results)]
+
+        if state["inputs"] != current_inputs:
             raise ValueError("Scoring inputs changed during extraction; final output was not saved.")
 
         # Assembles the saved blocks into scores.npy, keeping windows and PRSs separate.

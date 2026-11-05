@@ -3,8 +3,9 @@
 import argparse
 from pathlib import Path
 
-from blocprs.selection import filter_participants, id_positions, read_participants
-from blocprs.selection import sample_subsets, stratum_labels
+from participant_utils import filter_participants, id_positions, read_participants
+
+from dataset_utils import sample_subsets, stratum_labels
 
 
 # Defines options for participant filtering and training sample sizes.

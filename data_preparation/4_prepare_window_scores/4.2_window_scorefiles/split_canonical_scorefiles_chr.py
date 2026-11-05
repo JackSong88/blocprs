@@ -90,7 +90,8 @@ def split_scorefile(path, out_dir, mapping, full_chromosome=False):
                 matched.add(contribution)
 
                 # Fills this PRS's weight, creating a zero-filled list if needed; +2 skips the ID and allele.
-                window_weights.setdefault(window, ["0"] * len(sources))[index] = row[index + 2]
+                weights = window_weights.setdefault(window, ["0"] * len(sources))
+                weights[index] = row[index + 2]
 
             # Creates each window or full-chromosome output and writes its header once.
             for window, values in window_weights.items():
@@ -141,8 +142,12 @@ def main():
         count += len(counts)
 
     # Every retained nonzero variant weight must appear once in the output.
-    expected = {(variant, allele, source) for (variant, allele), sources in mapping.items()
-                for source, (_, weight) in sources.items() if weight != 0}
+    expected = set()
+
+    for (variant, allele), sources in mapping.items():
+        for source, (_, weight) in sources.items():
+            if weight != 0:
+                expected.add((variant, allele, source))
 
     if expected - matched:
         raise ValueError(f"Missing {len(expected - matched)} crosswalk entries in supplied scorefiles.")

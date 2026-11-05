@@ -10,11 +10,8 @@ from pathlib import Path
 
 def prepare_samplesheet(sampleset, prefix_template, genotype_format, chromosomes, output):
 
-    if "{chrom}" not in prefix_template:
-        raise ValueError("The prefix template must contain {chrom}, for example /data/chr_{chrom}.")
-
-    if len(chromosomes) != len(set(chromosomes)):
-        raise ValueError("Each chromosome must appear only once.")
+    assert "{chrom}" in prefix_template, "Missing {chrom} in prefix template."
+    assert len(chromosomes) == len(set(chromosomes)), "Repeated chromosomes."
 
     rows = []
 
@@ -59,7 +56,7 @@ def main():
     try:
         count = prepare_samplesheet(args.sampleset, args.prefix_template, args.genotype_format,
                                     args.chromosomes, args.output)
-    except (OSError, ValueError, KeyError) as error:
+    except (AssertionError, OSError, ValueError, KeyError) as error:
         parser.exit(1, f"Error: {error}\n")
 
     print(f"Wrote {count} chromosome rows to {args.output}")

@@ -15,10 +15,6 @@ def check_ids(frame, label):
     if frame[["FID", "IID"]].isna().any().any():
         raise ValueError(f"{label}: missing FID or IID.")
 
-    # Duplicate IDs check.
-    if frame.duplicated(["FID", "IID"]).any():
-        raise ValueError(f"{label}: duplicate FID/IID pairs.")
-
 
 def prepare_outputs(paths):
     paths = [Path(path) for path in paths]

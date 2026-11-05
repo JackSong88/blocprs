@@ -36,9 +36,12 @@ def build_figure(panels):
         regional_heatmap(axes[1, column], panel, panel["coefficients"][2], cmap, norm)
 
         # Non-EUR overlays retain separate ancestry-specific GWAS points, not a pooled association test.
-        groups = (("Female",), ("Male",)) if panel["key"] == "creatinine" else (
-            ("EUR",), tuple(source for source in panel["sources"] if source != "EUR"))
-        labels = ("Female", "Male") if panel["key"] == "creatinine" else ("EUR", "Non-EUR")
+        if panel["key"] == "creatinine":
+            groups = (("Female",), ("Male",))
+            labels = ("Female", "Male")
+        else:
+            groups = (("EUR",), tuple(source for source in panel["sources"] if source != "EUR"))
+            labels = ("EUR", "Non-EUR")
 
         for ax, group, label in zip(axes[2:, column], groups, labels):
             regional_gwas_track(ax, panel, group, label)

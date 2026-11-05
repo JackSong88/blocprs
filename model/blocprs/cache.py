@@ -1,7 +1,8 @@
 """Temporary, memory-mapped inputs for repeated model calculations.
 
-Raw CV rows are staged once. Transformed designs retain float64 values and
-are built separately for each training-fold scaler, then removed after use.
+Raw CV window scores S_tilde_iwk are staged once. Transformed designs retain
+float64 values and are built separately for each training-fold scaler, then
+removed after use.
 """
 
 from contextlib import contextmanager

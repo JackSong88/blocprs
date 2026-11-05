@@ -1,7 +1,8 @@
-"""Paired bootstrap uncertainty for fixed genetic scores.
+"""Paired bootstrap uncertainty for fixed genetic scores s_i.
 
 All methods share each resample. Binary resampling preserves the numbers of
-cases and controls. Only the evaluation regressions are refitted, not the PRS.
+cases and controls. Only the evaluation regressions are refitted; the source
+and regional weights defining s_i remain fixed.
 """
 
 import gc
@@ -68,7 +69,11 @@ def _weighted_values(y, covariates, scores, methods, family, counts, label):
         def fit(matrix):
 
             # Multiplying rows by sqrt(count) gives the resampled OLS fit without duplicate rows.
-            coef = np.linalg.lstsq(matrix * sqrt_weights[:, None], y * sqrt_weights, rcond=None)[0]
+            weighted_design = matrix * sqrt_weights[:, None]
+            weighted_outcome = y * sqrt_weights
+            coef = np.linalg.lstsq(weighted_design, weighted_outcome, rcond=None)[0]
+            del weighted_design, weighted_outcome
+
             residual = y - matrix @ coef
             return float(weights @ (residual * residual))
 
@@ -79,12 +84,16 @@ def _weighted_values(y, covariates, scores, methods, family, counts, label):
 
         def fit(matrix):
 
-            # Weighted centering and scaling improve IRLS conditioning without adding a penalty.
+            # Evaluation-only weighted scaling improves IRLS conditioning without a penalty.
+            # These resample statistics are separate from training source SDs sigma_k.
             predictors = matrix[:, 1:]
             centered = predictors - np.average(predictors, axis=0, weights=weights)
             variance = np.average(centered * centered, axis=0, weights=weights)
             varying = variance > 0
-            matrix = np.column_stack((np.ones(len(y)), centered[:, varying] / np.sqrt(variance[varying])))
+            intercept = np.ones(len(y))
+            scaled_predictors = centered[:, varying] / np.sqrt(variance[varying])
+            matrix = np.column_stack((intercept, scaled_predictors))
+            del intercept, scaled_predictors
 
             with warnings.catch_warnings():
                 warnings.simplefilter("error", PerfectSeparationWarning)
@@ -144,11 +153,9 @@ def bootstrap_metrics(y, covariates, scores, *, family, n_boot=10000, seed=20260
     table = pd.DataFrame(scores)
     methods = tuple(table.columns)
 
-    if not methods or len(methods) != len(set(methods)):
-        raise ValueError("Provide at least one score with unique method names.")
+    assert methods and len(methods) == len(set(methods))
 
-    if any(not isinstance(name, str) or not name.strip() for name in methods):
-        raise ValueError("Method names must be nonempty strings.")
+    assert all(isinstance(name, str) and name.strip() for name in methods)
 
     values = table.to_numpy(dtype=np.float64)
 
@@ -164,7 +171,11 @@ def bootstrap_metrics(y, covariates, scores, *, family, n_boot=10000, seed=20260
     participants = np.arange(len(y))
 
     # Resamples controls and cases separately for binary phenotypes.
-    strata = [np.flatnonzero(y == value) for value in (0.0, 1.0)] if binary else [participants]
+    if binary:
+        strata = [np.flatnonzero(y == value) for value in (0.0, 1.0)]
+    else:
+        strata = [participants]
+
     probabilities = [np.full(len(rows), 1.0 / len(rows)) for rows in strata]
 
     started = last_report = monotonic()
@@ -204,9 +215,6 @@ def bootstrap_metrics(y, covariates, scores, *, family, n_boot=10000, seed=20260
 
 # Summarizes paired metric differences, each method minus the named reference.
 def paired_comparisons(result, reference):
-    if reference not in result.methods:
-        raise ValueError(f"Reference method {reference!r} is absent from the scores.")
-
     reference_column = result.methods.index(reference)
     rows = []
 

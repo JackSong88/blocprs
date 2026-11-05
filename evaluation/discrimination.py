@@ -1,4 +1,4 @@
-"""AUROC and paired DeLong uncertainty for fixed genetic scores."""
+"""AUROC and paired DeLong uncertainty for fixed genetic scores s_i."""
 
 import math
 
@@ -11,8 +11,7 @@ def delong_covariance(y, scores):
     y = np.asarray(y)
     scores = np.asarray(scores, dtype=float)
 
-    if scores.ndim != 2 or scores.shape[0] != len(y):
-        raise ValueError("Scores need one row per participant and one column per method.")
+    assert scores.ndim == 2 and scores.shape[0] == len(y)
 
     if not np.isin(y, [0, 1]).all() or not np.isfinite(scores).all():
         raise ValueError("AUROC requires binary outcomes and finite scores.")
@@ -47,7 +46,7 @@ def delong_covariance(y, scores):
     return v.mean(axis=1), covariance
 
 
-# Reports raw-score AUROC without fitting covariates or reversing score directions.
+# Reports AUROC of supplied s_i without fitting covariates or reversing score directions.
 def evaluate_auroc(y, scores, references=()):
     y = np.asarray(y)
     methods = list(scores)

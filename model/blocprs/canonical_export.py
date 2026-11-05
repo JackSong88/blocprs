@@ -147,21 +147,21 @@ def export_canonical_snp_weights(model, cross_mapping, *, cohort, genome_build, 
     The stated build is required because neither PVAR nor the crosswalk guarantees build metadata.
     """
 
-    if cohort not in ("ukbb", "cartagene") or genome_build not in ("GRCh37", "GRCh38"):
-        raise ValueError("Specify cohort ukbb/cartagene and the actual PVAR genome build GRCh37/GRCh38.")
+    assert cohort in ("ukbb", "cartagene") and genome_build in ("GRCh37", "GRCh38")
 
-    paths = [Path(cross_mapping)] if isinstance(cross_mapping, (str, Path)) else [Path(item) for item in cross_mapping]
+    if isinstance(cross_mapping, (str, Path)):
+        paths = [Path(cross_mapping)]
+    else:
+        paths = [Path(item) for item in cross_mapping]
 
-    if not paths or len({item.resolve() for item in paths}) != len(paths):
-        raise ValueError("Supply each final assigned crosswalk file exactly once.")
+    assert paths and len({item.resolve() for item in paths}) == len(paths)
 
     # Keeps only the fitted sources, with their existing variant-to-window assignments.
     sources, windows, *_ = _model_arrays(model)
     mapping = _read_cross_mapping(paths, sources, windows, cohort)
     template = str(pvar_template or f"data/{cohort}/genotypes/chr{{chr}}.pvar")
 
-    if "{chr}" not in template:
-        raise ValueError("pvar_template must contain {chr} for the cohort chromosome files.")
+    assert "{chr}" in template
 
     oriented = []
 
@@ -177,8 +177,8 @@ def export_canonical_snp_weights(model, cross_mapping, *, cohort, genome_build, 
         if not (reversed_allele | frame["matched_allele"].eq(frame["alt"])).all():
             raise ValueError("A matched effect allele is neither REF nor ALT in the cohort PVAR.")
 
-        # beta * dosage(REF) = 2 * beta - beta * dosage(ALT).
-        # The offset preserves the score level when REF dosage is rewritten as ALT dosage.
+        # beta_jk * dosage(REF) = 2 * beta_jk - beta_jk * dosage(ALT), for raw source weights.
+        # The constant preserves the score level; export scales both terms by c_eff_wk / sigma_k.
         frame["allele_offset"] = np.where(reversed_allele, 2 * frame["weight"], 0.0)
         frame["weight"] = np.where(reversed_allele, -frame["weight"], frame["weight"])
         frame["effect_allele"], frame["other_allele"] = frame["alt"], frame["ref"]

@@ -1,9 +1,7 @@
 """Window-level polygenic scores and training-derived standardization.
 
 Scores are organized by participant, genomic window and source.
-Blockwise processing limits memory use during fitting and prediction.
-Inputs must be harmonized and aligned by participant before use;
-validation and prediction retain the training means and SDs.
+Blockwise processing improves memory efficiency during fitting and prediction.
 """
 
 from dataclasses import dataclass
@@ -13,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .selection import id_positions
+from participant_utils import id_positions
 
 
 class _ScoreView:
@@ -34,36 +32,63 @@ class _ScoreView:
 
     # Reads only the requested rows, windows and sources into memory.
     def __getitem__(self, key):
-        key = key if isinstance(key, tuple) else (key,)
-        ellipsis = next((i for i, item in enumerate(key) if item is Ellipsis), None)
+        if not isinstance(key, tuple):
+            key = (key,)
+
+        # Finds ... in the requested indexing, if present.
+        ellipsis = None
+
+        for position, item in enumerate(key):
+            if item is Ellipsis:
+                ellipsis = position
+                break
 
         if ellipsis is not None:
+            before = key[:ellipsis]
+            after = key[ellipsis + 1:]
+            missing_dimensions = 3 - len(before) - len(after)
 
-            # Expands ... to cover the missing axes.
-            key = key[:ellipsis] + (slice(None),) * (4 - len(key)) + key[ellipsis + 1:]
+            # slice(None) is :, selecting everything along that dimension.
+            full_selections = (slice(None),) * missing_dimensions
+            key = before + full_selections + after
 
         if len(key) > 3:
             raise IndexError("Window scores have three dimensions.")
 
-        key = key + (slice(None),) * (3 - len(key))
+        # Unspecified trailing dimensions also select all entries: view[rows] means view[rows, :, :].
+        missing_dimensions = 3 - len(key)
+        key = key + (slice(None),) * missing_dimensions
 
-        if any(not isinstance(index, (slice, Integral)) or isinstance(index, (bool, np.bool_)) for index in key[1:]):
-            raise IndexError("Use scalar/slice window and source indices; select_sources handles named source lists.")
+        for index in key[1:]:
+            if not isinstance(index, (slice, Integral)) or isinstance(index, (bool, np.bool_)):
+                raise IndexError("Use scalar/slice window and source indices; select_sources handles named source lists.")
 
-        selected = (self.rows[key[0]], np.arange(self.shape[1])[key[1]], self.sources[key[2]])
+        # Maps the requested participants and sources back to the original score array.
+        row_indices = self.rows[key[0]]
+        window_indices = np.arange(self.shape[1])[key[1]]
+        source_indices = self.sources[key[2]]
 
-        # np.ix_ gathers all selected row/window/source combinations, not paired indices.
-        # Unused source columns are never loaded into this block.
-        values = self.scores[np.ix_(*(np.atleast_1d(indices) for indices in selected))]
-        scalar_axes = tuple(axis for axis, indices in enumerate(selected) if np.ndim(indices) == 0)
+        # Converts a single index to a one-element array for np.ix_.
+        rows = np.atleast_1d(row_indices)
+        windows = np.atleast_1d(window_indices)
+        sources = np.atleast_1d(source_indices)
 
-        return values.squeeze(axis=scalar_axes)
+        # np.ix_ selects every requested row/window/source combination, not paired indices.
+        values = self.scores[np.ix_(rows, windows, sources)]
+        scalar_axes = []
+
+        # Integer indexing drops that dimension, while a slice keeps it.
+        for axis, indices in enumerate((row_indices, window_indices, source_indices)):
+            if np.ndim(indices) == 0:
+                scalar_axes.append(axis)
+
+        return values.squeeze(axis=tuple(scalar_axes))
 
 
+# -- Sanity Checks used throughout --
 # Checks that names are unique and nonempty, keeping their supplied order.
 def _names(values, size, label):
-    if isinstance(values, (str, bytes)):
-        raise ValueError(f"{label} must be a sequence of names, not one string.")
+    assert not isinstance(values, (str, bytes))
 
     values = tuple(values)
 
@@ -80,8 +105,7 @@ def _names(values, size, label):
 def _numeric(values, ndim, label):
     array = values if isinstance(values, _ScoreView) else np.asanyarray(values)
 
-    if np.ma.isMaskedArray(array) or array.ndim != ndim or array.dtype.kind not in "biuf":
-        raise ValueError(f"{label} must be a {ndim}-dimensional ordinary real numeric array.")
+    assert (not np.ma.isMaskedArray(array) and array.ndim == ndim and array.dtype.kind in "biuf"), f"Invalid {label} type or shape."
 
     return array
 
@@ -107,12 +131,11 @@ def _float32(values, label):
 class PRSData:
     """Aligned window-level PRSs, phenotypes, covariates and participant IDs.
 
-    Scores have shape (participants, windows, sources); covariates have shape
+    Raw scores S_tilde_iwk have shape (participants, windows, sources); covariates have shape
     (participants, covariates). Optional y contains one phenotype per participant.
     Inputs must already be harmonized and in matching participant order.
     Names retain the supplied order. IDs are checked, not used to align arrays.
-    Existing arrays are used directly; do not change them during fitting or
-    prediction. Score values are checked as each participant block is processed.
+    Score values are checked as each participant block is processed.
     """
 
     # Records aligned raw arrays and checks layout and participant IDs.
@@ -123,22 +146,21 @@ class PRSData:
         self.window_scores = _numeric(window_scores, 3, "window_scores")
         self.n_samples, self.n_windows, self.n_sources = self.window_scores.shape
 
-        if min(self.window_scores.shape) < 1:
-            raise ValueError("window_scores must contain participants, windows, and sources.")
+        assert min(self.window_scores.shape) >= 1
 
         self.source_names = _names(source_names, self.n_sources, "source_names")
         self.window_names = _names(window_names, self.n_windows, "window_names")
 
         self.y = None if y is None else _numeric(y, 1, "y")
 
-        if self.y is not None and self.y.shape != (self.n_samples,):
-            raise ValueError("y must contain one outcome per participant.")
+        assert self.y is None or self.y.shape == (self.n_samples,)
 
-        self.covariates = (np.empty((self.n_samples, 0), dtype=np.float32) if covariates is None
-                           else _numeric(covariates, 2, "covariates"))
+        if covariates is None:
+            self.covariates = np.empty((self.n_samples, 0), dtype=np.float32)
+        else:
+            self.covariates = _numeric(covariates, 2, "covariates")
 
-        if self.covariates.shape[0] != self.n_samples:
-            raise ValueError("covariates must contain one row per participant.")
+        assert self.covariates.shape[0] == self.n_samples
 
         self.n_covariates = self.covariates.shape[1]
 
@@ -183,7 +205,7 @@ class PRSData:
 
 # Loads one saved split, keeping large score arrays on disk.
 def load_dataset(path, split="train", ids_file=None):
-    """Load a stage-5 dataset as PRSData, without standardizing its values.
+    """Load a dataset as PRSData, without standardizing its values.
 
     Select the stored 'train', 'test' or 'all' split. Only split=None combines
     all stored rows; 'all' is the transfer split, not a train/test combination.
@@ -219,7 +241,10 @@ def load_dataset(path, split="train", ids_file=None):
         raise ValueError("Saved arrays and their participant/feature names have inconsistent dimensions.")
 
     # Selects the saved split first; an ID file can only narrow that selection.
-    rows = np.arange(len(participants)) if split is None else np.flatnonzero(participants["split"].eq(split))
+    if split is None:
+        rows = np.arange(len(participants))
+    else:
+        rows = np.flatnonzero(participants["split"].eq(split))
 
     if ids_file is not None:
         rows = rows[id_positions(participants.iloc[rows], ids_file)]
@@ -229,8 +254,14 @@ def load_dataset(path, split="train", ids_file=None):
 
     # Contiguous splits remain ordinary slices; other selections are blockwise views.
     contiguous = np.all(np.diff(rows) == 1)
-    selection = slice(int(rows[0]), int(rows[-1]) + 1) if contiguous else rows
-    selected_scores = scores[selection] if contiguous else _ScoreView(scores, rows)
+
+    if contiguous:
+        selection = slice(int(rows[0]), int(rows[-1]) + 1)
+        selected_scores = scores[selection]
+    else:
+        selection = rows
+        selected_scores = _ScoreView(scores, rows)
+
     selected = participants.iloc[selection]
 
     return PRSData(selected_scores, sources, windows, y=selected["phenotype"].to_numpy(dtype=float),
@@ -242,8 +273,7 @@ def load_dataset(path, split="train", ids_file=None):
 def select_sources(data, source_names):
     source_names = tuple(source_names)
 
-    if not source_names or len(set(source_names)) != len(source_names):
-        raise ValueError("Select at least one distinct source name.")
+    assert source_names and len(set(source_names)) == len(source_names)
 
     if source_names == data.source_names:
         return data
@@ -256,12 +286,33 @@ def select_sources(data, source_names):
 
 
 @dataclass
+class GenomewideScaler:
+    """Training mu_k and sigma_k of raw S_tilde_ik; covariates and y remain unscaled."""
+
+    source_mean: np.ndarray
+    source_sd: np.ndarray
+
+    # Computes mu_k and population SD sigma_k across the supplied training participants.
+    @classmethod
+    def fit(cls, sources):
+        sd = np.std(sources, axis=0, ddof=0)
+        sd[sd == 0] = 1
+        return cls(np.mean(sources, axis=0), sd)
+
+    # Computes S_ik = (S_tilde_ik - mu_k) / sigma_k using saved training values.
+    def transform(self, sources):
+        return (sources - self.source_mean) / self.source_sd
+
+
+@dataclass
 class Scaler:
     """Training means and standard deviations for model standardization.
 
-    window_mean: W x K; source_sd: K; cov_mean/cov_sd: C; y_mean/y_sd: scalar.
+    window_mean stores mu_wk (W x K); source_sd stores sigma_k (K).
+    cov_mean/cov_sd have one value per covariate; y_mean/y_sd are scalars.
     W, K and C are the numbers of windows, sources and covariates.
-    Each source SD comes from its genome-wide sum of window scores (ddof=0).
+    mu_wk is the training mean of raw S_tilde_iwk. sigma_k is the training SD
+    of S_tilde_ik = sum_w S_tilde_iwk (ddof=0), not a separate SD per window.
     Stored values use float32. Constant columns use 1 in place of a zero SD.
     Covariates and phenotypes with at most two distinct values stay unchanged,
     using mean=0 and SD=1. Prediction reuses these training values.
@@ -280,15 +331,13 @@ class Scaler:
 
     # Checks the training means and SDs, then stores them as float32.
     def __post_init__(self):
-        if self.family not in ("gaussian", "binomial"):
-            raise ValueError("family must be 'gaussian' or 'binomial'.")
+        assert self.family in ("gaussian", "binomial")
 
         self.source_names = _names(self.source_names, len(self.source_names), "source_names")
         self.window_names = _names(self.window_names, len(self.window_names), "window_names")
         self.covariate_names = _names(self.covariate_names, len(self.covariate_names), "covariate_names")
 
-        if not self.source_names or not self.window_names:
-            raise ValueError("Scaler requires at least one source and window.")
+        assert self.source_names and self.window_names
 
         shapes = {
             "window_mean": (len(self.window_names), len(self.source_names)),
@@ -308,37 +357,34 @@ class Scaler:
         for name in ("y_mean", "y_sd"):
             value = _float32(getattr(self, name), name)
 
-            if value.ndim != 0:
-                raise ValueError(f"{name} must be a scalar.")
+            assert value.ndim == 0
 
             setattr(self, name, float(value))
 
-        if self.y_sd <= 0:
-            raise ValueError("y_sd must be positive.")
+        assert self.y_sd > 0
 
         if self.family == "binomial" and (self.y_mean != 0 or self.y_sd != 1):
             raise ValueError("Binomial outcomes must remain unscaled.")
 
-    # Computes means and SDs from training rows in blocks, using float64 sums.
+    # Computes training mu_wk and sigma_k in blocks of individuals, with float64 sums.
     @classmethod
     def fit(cls, data, family, block_size=8192, *, rows=None):
         block_size = _block_size(block_size)
 
         assert family in ("gaussian", "binomial")
 
-        if data.y is None:
-            raise ValueError("Fitting a scaler requires training outcomes.")
+        assert data.y is not None
 
         # Selects fold-training rows without copying the full score matrix.
         if rows is not None:
             rows = np.asarray(rows)
 
-            if (rows.ndim != 1 or rows.dtype.kind not in "iu" or rows.size == 0
+            if (rows.ndim != 1 or not pd.api.types.is_integer_dtype(rows.dtype) or rows.size == 0
                 or np.any(rows < 0) or np.any(rows >= data.n_samples)
                 or len(np.unique(rows)) != len(rows)):
                 raise ValueError("rows must be unique, in-range integer indices.")
 
-        # Accumulates training moments without retaining the participant-by-feature matrix.
+        # Keeps running totals for mu_wk, mu_k and sigma_k, plus covariates and y.
         n_samples = data.n_samples if rows is None else len(rows)
         window_sum = np.zeros((data.n_windows, data.n_sources), dtype=np.float64)
         global_sum = np.zeros(data.n_sources, dtype=np.float64)
@@ -348,7 +394,8 @@ class Scaler:
         y_sum = y_ss = 0.0
         distinct = [set() for _ in range(data.n_covariates + 1)]
 
-        # Computes means first, then squared deviations for more accurate SDs.
+        # Pass 1 accumulates window totals for mu_wk and computes genome-wide mu_k.
+        # Pass 2 rereads all training blocks to compute sigma_k around the known mu_k.
         for pass_number in (0, 1):
             for start in range(0, n_samples, block_size):
                 stop = min(start + block_size, n_samples)
@@ -357,13 +404,12 @@ class Scaler:
                 covariates = _float32(data.covariates[selection], "covariates")
                 y = _float32(data.y[selection], "y")
 
-                if family == "binomial" and not np.isin(data.y[selection], (0, 1)).all():
-                    raise ValueError("Binomial outcomes must be exactly 0 or 1.")
-
-                # Sums windows to get each source's genome-wide score.
+                # S_tilde_ik = sum_w S_tilde_iwk, separately for each participant and source.
                 global_score = windows.sum(axis=1, dtype=np.float64)
 
                 if pass_number == 0:
+
+                    # Sums over participants; dividing these totals by N gives the means.
                     window_sum += windows.sum(axis=0, dtype=np.float64)
                     global_sum += global_score.sum(axis=0, dtype=np.float64)
                     cov_sum += covariates.sum(axis=0, dtype=np.float64)
@@ -372,14 +418,17 @@ class Scaler:
                     # Identifies columns with at most two distinct values before rounding.
                     for j in range(data.n_covariates + 1):
                         if len(distinct[j]) <= 2:
-                            raw = (data.y[selection] if j == data.n_covariates
-                                   else data.covariates[selection, j])
+                            if j == data.n_covariates:
+                                raw = data.y[selection]
+                            else:
+                                raw = data.covariates[selection, j]
+
                             distinct[j].update(np.unique(raw)[:3].tolist())
 
                 else:
                     global_score -= global_mean
 
-                    # Sums squared deviations over participants, retaining one value per source.
+                    # Accumulates sum_i (S_tilde_ik - mu_k)^2, one total per source.
                     global_ss += np.einsum("ij,ij->j", global_score, global_score)
                     cov_delta = covariates.astype(np.float64) - cov_mean
                     cov_ss += np.einsum("ij,ij->j", cov_delta, cov_delta)
@@ -387,14 +436,18 @@ class Scaler:
                     y_ss += float(y_delta @ y_delta)
 
             if pass_number == 0:
+
+                # Checks binary labels once, using the original values before float32 rounding.
+                if family == "binomial" and distinct[-1] != {0, 1}:
+                    raise ValueError("Binomial training outcomes must contain both 0 and 1 and no other values.")
+
+                # mu_k = sum_i S_tilde_ik / N, using every selected training participant.
                 global_mean = global_sum / n_samples
                 cov_mean = cov_sum / n_samples
                 y_mean = y_sum / n_samples
 
-        if family == "binomial" and distinct[-1] != {0, 1}:
-            raise ValueError("Binomial training outcomes must contain both classes.")
-
-        # Computes population SDs (ddof=0), using 1 for constant columns.
+        # sigma_k = sqrt(sum_i (S_tilde_ik - mu_k)^2 / N), using population SDs.
+        # Constant columns use a denominator of 1 to avoid division by zero.
         source_sd = np.sqrt(global_ss / n_samples).astype(np.float32)
         cov_sd = np.sqrt(cov_ss / n_samples).astype(np.float32)
         source_sd[source_sd == 0] = 1
@@ -412,18 +465,19 @@ class Scaler:
         elif y_sd == 0:
             y_sd = 1
 
+        # mu_wk = sum_i S_tilde_iwk / N, from the window totals collected in pass 1.
         return cls(family, data.source_names, data.window_names, data.covariate_names,
                    window_sum / n_samples, source_sd, cov_mean, cov_sd, y_mean, y_sd)
 
-    # Standardizes windows using their training means and genome-wide source SDs.
+    # Converts raw S_tilde_iwk to S_iwk using training mu_wk and sigma_k.
     def transform_windows(self, values):
         result = _float32(values, "window_scores")
 
         if result.ndim != 3 or result.shape[1:] != self.window_mean.shape:
             raise ValueError("Window-score block does not match the fitted layout.")
 
-        # S_window = (raw_window - training_window_mean) / training_source_SD.
-        # Using one SD per source makes the window sum equal its standardized genome-wide score.
+        # S_iwk = (S_tilde_iwk - mu_wk) / sigma_k.
+        # The shared source SD preserves sum_w S_iwk = S_ik, up to rounding.
         result -= self.window_mean
         result /= self.source_sd
 
@@ -451,8 +505,7 @@ class Scaler:
     def transform_outcome(self, values):
         result = _float32(values, "y")
 
-        if result.ndim != 1:
-            raise ValueError("Outcome block must be a vector.")
+        assert result.ndim == 1
 
         if self.family == "binomial" and not np.isin(values, (0, 1)).all():
             raise ValueError("Binomial outcomes must be exactly 0 or 1.")
@@ -469,8 +522,8 @@ class Scaler:
 class Design:
     """Blockwise construction of the BLocPRS design matrix.
 
-    Each block contains an intercept, covariates, genome-wide source scores
-    and centered window scores: [1, C, S_global, Z]. Training means and SDs
+    Each row contains an intercept, covariates C_ic, source scores S_ik
+    and window contrasts Z_iwk: [1, C, S, Z]. Training means and SDs
     stay fixed during validation and prediction. Selected participants retain
     their supplied order. Standardization uses float32; model blocks use float64.
     """
@@ -490,8 +543,7 @@ class Design:
         if isinstance(rows, slice):
             start, stop, step = rows.indices(data.n_samples)
 
-            if step != 1:
-                raise ValueError("Row slices must have step=1; use explicit indices otherwise.")
+            assert step == 1
 
             self.rows = slice(start, stop, 1)
             self.n_samples = max(0, stop - start)
@@ -501,15 +553,14 @@ class Design:
             if rows.dtype.kind == "b" and rows.shape == (data.n_samples,):
                 rows = np.flatnonzero(rows)
 
-            if (rows.ndim != 1 or rows.dtype.kind not in "iu" or np.any(rows < 0)
+            if (rows.ndim != 1 or not pd.api.types.is_integer_dtype(rows.dtype) or np.any(rows < 0)
                 or np.any(rows >= data.n_samples) or len(np.unique(rows)) != len(rows)):
                 raise ValueError("rows must be unique, in-range integer indices or an N-vector mask.")
 
             self.rows = rows.astype(np.int64, copy=True)
             self.n_samples = len(rows)
 
-        if self.n_samples < 1:
-            raise ValueError("Design must contain at least one participant.")
+        assert self.n_samples >= 1
 
         self.n_covariates = data.n_covariates
         self.n_features = 1 + data.n_covariates + data.n_sources * (1 + data.n_windows)
@@ -518,8 +569,11 @@ class Design:
     def _blocks(self):
         for start in range(0, self.n_samples, self.block_size):
             stop = min(start + self.block_size, self.n_samples)
-            rows = (slice(self.rows.start + start, self.rows.start + stop)
-                    if isinstance(self.rows, slice) else self.rows[start:stop])
+            if isinstance(self.rows, slice):
+                rows = slice(self.rows.start + start, self.rows.start + stop)
+            else:
+                rows = self.rows[start:stop]
+
             yield start, stop, rows
 
     # Builds float64 (X, y) blocks in the selected participant order.
@@ -531,21 +585,23 @@ class Design:
 
         for start, stop, rows in self._blocks():
 
-            # Builds X = [1, C, S_global, Z], writing window contrasts into X in place.
+            # Builds X = [1, C, S, Z], with source columns S_ik and window columns Z_iwk.
             X = np.empty((stop - start, self.n_features), dtype=np.float64)
             X[:, 0] = 1
             X[:, 1:first_genetic] = self.scaler.transform_covariates(data.covariates[rows])
 
-            # S_global sums windows; Z subtracts each source's uniform window share.
-            # The contrasts sum to zero across windows, separating local from global effects.
+            # S_ik = sum_w S_iwk; Z_iwk = S_iwk - S_ik / W.
+            # sum_w Z_iwk = 0 separates regional adjustments from genome-wide effects.
             windows = X[:, first_window:].reshape(-1, data.n_windows, data.n_sources)
             windows[:] = self.scaler.transform_windows(data.window_scores[rows])
             global_score = X[:, first_genetic:first_window]
             global_score[:] = windows.sum(axis=1, dtype=np.float64)
             windows -= global_score[:, None, :] * (1.0 / data.n_windows)
 
-            y = (None if not include_outcome or data.y is None
-                 else self.scaler.transform_outcome(data.y[rows]).astype(np.float64))
+            if not include_outcome or data.y is None:
+                y = None
+            else:
+                y = self.scaler.transform_outcome(data.y[rows]).astype(np.float64)
 
             if not np.isfinite(X).all():
                 raise ValueError("Nonfinite model design.")

@@ -1,21 +1,15 @@
-"""Covariate-adjusted evaluation of fixed polygenic scores.
+"""Covariate-adjusted evaluation of fixed genetic scores s_i.
 
 Incremental R^2 and covariate-conditioned Nagelkerke R^2 compare regressions
-fitted with and without the PRS on the same evaluation participants.
-Source and regional coefficients remain fixed during evaluation.
+fitted with and without s_i on the same evaluation participants. The intercept,
+covariate coefficients and one score coefficient are refitted; the source
+and regional weights defining s_i remain fixed.
 """
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tools.sm_exceptions import PerfectSeparationError
-
-
-INCREMENTAL_R2_VERSION = "incremental_r2_ols_v1"
-INCREMENTAL_R2_DEFINITION = "R2_OLS(y~1+C+genetic_score)-R2_OLS(y~1+C);validation_refit"
-NAGELKERKE_R2_VERSION = "nagelkerke_r2_logit_v1"
-NAGELKERKE_R2_DEFINITION = ("(1-exp(-2*(ll_Logit(y~1+C+genetic_score)-ll_Logit(y~1+C))/n))"
-                          "/(1-exp(2*ll_Logit(y~1+C)/n));validation_refit")
 
 
 class NonEstimableError(ValueError):
@@ -29,8 +23,10 @@ def _inputs(y, covariates):
     if y.ndim != 1 or not np.isfinite(y).all():
         raise ValueError("Evaluation requires a finite phenotype vector.")
 
-    covariates = (np.empty((len(y), 0), dtype=np.float64) if covariates is None
-                  else np.asarray(covariates, dtype=np.float64))
+    if covariates is None:
+        covariates = np.empty((len(y), 0), dtype=np.float64)
+    else:
+        covariates = np.asarray(covariates, dtype=np.float64)
 
     if covariates.ndim != 2 or covariates.shape[0] != len(y) or not np.isfinite(covariates).all():
         raise ValueError("Covariates must be finite with one row per participant.")
@@ -41,7 +37,7 @@ def _inputs(y, covariates):
     return y.copy(), covariates.copy()
 
 
-# Standardizes the frozen score for the unpenalized evaluation regression.
+# Rescales the combined PRS for numerical stability in evaluation regressions.
 def _standardized_score(genetic_score, y):
     score = np.asarray(genetic_score, dtype=np.float64)
 
@@ -52,8 +48,11 @@ def _standardized_score(genetic_score, y):
     if np.all(score == score[0]):
         return np.zeros_like(score)
 
-    # Rescales only this auxiliary regression's input for numerical stability.
-    # With a free intercept and score coefficient, its fitted values are unchanged in exact arithmetic.
+    # Training standardizes the source PRSs, but their weighted sum s_i can still
+    # have a very small SD. Rescaling s_i here improves numerical stability.
+    # Uses this evaluation sample's mean and SD; the genetic weights remain fixed.
+    # The unpenalized regression's free intercept and score coefficient absorb
+    # this rescaling, preserving fitted values and R^2 in exact arithmetic.
     score = score - score.mean()
     score_sd = score.std(ddof=0)
 
@@ -64,9 +63,15 @@ def _standardized_score(genetic_score, y):
 
 
 class IncrementalR2:
-    """Gain in OLS R^2 from adding the fixed PRS to a covariate-only model.
+    """Gain in OLS R^2 from adding fixed s_i to a covariate-only model.
 
-    Both models use the same participants and total phenotype variance.
+    Null: y ~ intercept + covariates
+    Full: y ~ intercept + covariates + frozen PRS
+
+    Both OLS regressions use the same evaluation participants and total phenotype variance.
+    The genetic weights defining the PRS remain fixed.
+
+    Incremental R^2 = (RSS_null - RSS_full) / TSS, where TSS = sum_i (y_i - mean(y))^2.
     """
 
     # Fits the covariate-only OLS model and retains its residual sum of squares.
@@ -83,7 +88,7 @@ class IncrementalR2:
         residual = self.y - self.null_design @ coef
         self.null_ss = float(residual @ residual)
 
-    # Refits OLS with the frozen score and returns its incremental R^2.
+    # Refits OLS with frozen s_i and returns its incremental R^2.
     def score(self, genetic_score):
         score = _standardized_score(genetic_score, self.y)
 
@@ -105,9 +110,16 @@ class IncrementalR2:
 
 
 class NagelkerkeR2:
-    """Covariate-conditioned Nagelkerke R^2 for a fixed polygenic score.
+    """Covariate-conditioned Nagelkerke R^2, following Ge et al. (2019).
 
-    Both models use the same participants; normalization uses the covariate-only fit.
+    Null: y ~ intercept + covariates
+    Full: y ~ intercept + covariates + frozen PRS
+
+    Both regressions are fitted on the same evaluation participants.
+    The genetic weights defining the PRS remain fixed.
+
+    ll0 and ll1 are the fitted null and full log-likelihoods:
+    R^2 = (1 - exp(-2 * (ll1 - ll0) / n)) / (1 - exp(2 * ll0 / n)).
     """
 
     # Fits the covariate-only logistic model and computes the normalization factor.
@@ -148,7 +160,7 @@ class NagelkerkeR2:
 
         return float(result.llf)
 
-    # Refits logistic regression with the frozen score and returns Nagelkerke R^2.
+    # Refits logistic regression with frozen s_i and returns Nagelkerke R^2.
     def score(self, genetic_score):
         score = _standardized_score(genetic_score, self.y)
 
@@ -166,11 +178,11 @@ class NagelkerkeR2:
         return float(value)
 
 
-# Evaluates the fixed PRS using OLS regressions fitted on these participants.
+# Evaluates fixed s_i using OLS regressions fitted on these participants.
 def incremental_r2(y, genetic_score, covariates=None):
     return IncrementalR2(y, covariates).score(genetic_score)
 
 
-# Evaluates the fixed PRS using logistic regressions fitted on these participants.
+# Evaluates fixed s_i using logistic regressions fitted on these participants.
 def nagelkerke_r2(y, genetic_score, covariates=None):
     return NagelkerkeR2(y, covariates).score(genetic_score)

@@ -201,8 +201,7 @@ def select_candidate(y, covariates, labels, scores, family):
 
 # Weight export includes selected ALT-allele effects and imputation means without genotype data.
 def export_weights(model_paths, label, output):
-    if label is None:
-        raise ValueError("Choose one candidate label for SNP-weight export.")
+    assert label is not None
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +223,6 @@ def export_weights(model_paths, label, output):
                 chromosomes.add(chromosome)
                 variants.update(snps)
 
-    if not chromosomes:
-        raise ValueError("No chromosome models supplied for SNP-weight export.")
+    assert chromosomes
 
     return output

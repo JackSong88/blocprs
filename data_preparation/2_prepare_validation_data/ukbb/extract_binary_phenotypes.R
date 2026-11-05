@@ -122,8 +122,6 @@ selected <- selected %>% filter(!eid %in% withdrawn)
 
 # Combines requested codes by OR; all missing remains missing, not a control.
 collapse_phecodes_or <- function(frame, columns) {
-  if (!length(columns)) return(rep(NA_integer_, nrow(frame)))
-
   values <- frame %>% select(all_of(columns)) %>%
     mutate(across(everything(), ~ suppressWarnings(as.numeric(.)))) %>% as.matrix()
   any_case <- apply(values == 1, 1, function(row) any(row, na.rm = TRUE))

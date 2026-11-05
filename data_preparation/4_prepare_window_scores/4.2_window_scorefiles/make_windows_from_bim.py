@@ -96,8 +96,7 @@ def make_windows(variant_path: str, window_size_bp: int, variant_format: str) ->
 def make_windows_genomewide(variant_template: str, chromosomes: list[int],
                            window_size_bp: int, variant_format: str) -> pd.DataFrame:
 
-    if "{chr}" not in variant_template:
-        raise ValueError("Genome-wide template must include '{chr}' placeholder")
+    assert "{chr}" in variant_template, "Missing {chr} in variant template."
 
     frames = []
 

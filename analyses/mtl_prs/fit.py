@@ -23,10 +23,10 @@ def calibrate_baseline(y, covariates, scores, pi):
     y, covariates = np.asarray(y, dtype=float), np.asarray(covariates, dtype=float)
     scores, pi = np.asarray(scores, dtype=float), np.asarray(pi, dtype=float)
 
-    if (y.ndim != 1 or len(y) < 2 or covariates.ndim != 2 or scores.ndim != 2
-            or len(covariates) != len(y) or len(scores) != len(y)
-            or pi.shape != (scores.shape[1],)):
-        raise ValueError("Calibration requires aligned outcome, covariate, score, and mixture arrays")
+    assert y.ndim == 1 and len(y) >= 2
+    assert covariates.ndim == 2 and scores.ndim == 2
+    assert len(covariates) == len(y) and len(scores) == len(y)
+    assert pi.shape == (scores.shape[1],)
 
     if not all(np.isfinite(a).all() for a in (y, covariates, scores, pi)):
         raise ValueError("Calibration inputs must be finite")
@@ -109,8 +109,7 @@ def coordinate_update_candidates(beta_initial, gram, gy, total_variants,
     factors = np.asarray(factors, dtype=float)
     m = len(beta_initial)
 
-    if beta_initial.shape != (m,) or gram.shape != (m, m) or gy.shape != (m,):
-        raise ValueError("Incompatible coefficient, Gram matrix, and phenotype-product shapes")
+    assert beta_initial.shape == (m,) and gram.shape == (m, m) and gy.shape == (m,)
 
     if total_variants <= 0 or iterations < 1 or np.any(factors <= 0):
         raise ValueError("Variant count, iterations, and learning-rate factors must be positive")
@@ -263,10 +262,18 @@ def fit_chromosome(genotype_prefix, weights_path, ids, calibration, total_varian
                 last_report = now
 
     # Concatenation joins the fitted blocks, retaining every candidate and its training moments.
-    arrays = {name: np.concatenate(parts[name]) if parts[name] else np.empty(0, dtype=dtype)
-              for name, dtype in columns.items()}
-    arrays["beta_raw"] = (np.concatenate(parts["beta_raw"]) if parts["beta_raw"]
-                          else np.empty((0, len(labels)), dtype=float))
+    arrays = {}
+
+    for name, dtype in columns.items():
+        if parts[name]:
+            arrays[name] = np.concatenate(parts[name])
+        else:
+            arrays[name] = np.empty(0, dtype=dtype)
+
+    if parts["beta_raw"]:
+        arrays["beta_raw"] = np.concatenate(parts["beta_raw"])
+    else:
+        arrays["beta_raw"] = np.empty((0, len(labels)), dtype=float)
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

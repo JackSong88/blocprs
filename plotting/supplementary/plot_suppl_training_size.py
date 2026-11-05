@@ -36,8 +36,14 @@ def build_figure(data, family):
     nrows = (len(order) + 2) // 3
     per_row, extra = divmod(len(order), nrows)
     row_sizes = [per_row + (row < extra) for row in range(nrows)]
-    positions = [(row, column + (3 - count) / 2)
-                 for row, count in enumerate(row_sizes) for column in range(count)]
+    positions = []
+
+    # Centers each populated row within the three-column layout.
+    for panel_row, count in enumerate(row_sizes):
+        column_offset = (3 - count) / 2
+
+        for panel_column in range(count):
+            positions.append((panel_row, panel_column + column_offset))
     height = nrows * 29 + 35
     figure = plt.figure(figsize=(183 / 25.4, height / 25.4))
 
@@ -61,7 +67,11 @@ def build_figure(data, family):
 
             # Panel origins differ; unavailable CaG traits retain the observed UKB origin.
             key = (phenotype, cohort)
-            origin = int(lower_steps.loc[key] if key in lower_steps.index else lower_steps.loc[phenotype].min())
+            if key in lower_steps.index:
+                origin = int(lower_steps.loc[key])
+            else:
+                origin = int(lower_steps.loc[phenotype].min())
+
             ticks = np.linspace(origin, origin + span_steps, 3) / 100
             ax.set(ylim=(ticks[0], ticks[-1]), yticks=ticks)
             ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))

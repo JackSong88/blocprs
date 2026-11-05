@@ -1,4 +1,4 @@
-"""Combine a saved model and canonical or harmonized source SNP weights into one TSV."""
+"""Combine a saved model and canonical or harmonized source variant weights into one TSV."""
 
 import argparse
 import logging
@@ -27,7 +27,7 @@ def read_source_weights(path):
     return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
 
 
-# Applies frozen genetic coefficients using generic weights or the assigned canonical crosswalk.
+# Exports c_eff_wk / sigma_k through source variant weights or the assigned canonical crosswalk.
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -51,7 +51,7 @@ def main(argv=None):
         parser.error("--cohort, --genome-build and --pvar-template apply only to --cross-mapping.")
 
     # Loads the fitted coefficients and combines the corresponding source weights.
-    print(f"Loading model and combining source SNP weights: {args.model}", flush=True)
+    print(f"Loading model and combining source variant weights: {args.model}", flush=True)
     model = BLocPRS.load(args.model)
 
     if args.cross_mapping:

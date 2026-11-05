@@ -172,7 +172,13 @@ def draw_comparison(ax, a, b, p, y, height):
     transform = ax.transData + ScaledTranslation(0, 2 / 72, ax.figure.dpi_scale_trans)
     ax.plot([a, a, b, b], [y, y + height, y + height, y], transform=transform,
             color="#555555", linewidth=0.4)
-    stars = "***" if p < 0.001 else "**" if p < 0.01 else "*"
+    if p < 0.001:
+        stars = "***"
+    elif p < 0.01:
+        stars = "**"
+    else:
+        stars = "*"
+
     ax.annotate(stars, ((a + b) / 2, y + height), xycoords=transform,
                 xytext=(0, 0.8), textcoords="offset points", ha="center", va="bottom", fontsize=5)
 
@@ -215,7 +221,11 @@ def draw_benchmark_cell(ax, frame, comparisons, ylim, first, auroc=False):
                             & comparisons.stratum.eq(row.stratum)]
 
     # Missing SEs affect bracket placement only; they are not drawn as zero-width error bars.
-    top = np.max(values[finite] + np.nan_to_num(errors[finite], nan=0)) if finite.any() else 0
+    if finite.any():
+        top = np.max(values[finite] + np.nan_to_num(errors[finite], nan=0))
+    else:
+        top = 0
+
     span, level = ylim[1] - ylim[0], 0
 
     for baseline in [compact_methods[1], compact_methods[0]]:
@@ -250,12 +260,23 @@ def draw_compact_benchmarks(data, comparisons, candidates, non_eur=False, scenar
     left, right, center = 0.100, 0.988, 0.544
     strata = ("non-EUR",) if non_eur else compact_strata
     blocks = [(scenario, family) for scenario in scenarios for family in candidates]
-    gap, header = (4, 15.5) if non_eur else (6, 16 if auroc else 12)
+    if non_eur:
+        gap, header = 4, 15.5
+    elif auroc:
+        gap, header = 6, 16
+    else:
+        gap, header = 6, 12
+
     block_height = (height - 10 - (10 if auroc else 9) - gap * (len(blocks) - 1)) / len(blocks)
     plot_height = block_height - header
     row_height = (plot_height - 3 * (len(strata) - 1)) / len(strata)
-    title = ("Non-EUR UKB training - non-EUR evaluation" if non_eur else "Full UKB training" if auroc
-             else cohort_labels[compact_scenarios.index(scenarios[0])] + " - Full UKB training")
+    if non_eur:
+        title = "Non-EUR UKB training - non-EUR evaluation"
+    elif auroc:
+        title = "Full UKB training"
+    else:
+        title = cohort_labels[compact_scenarios.index(scenarios[0])] + " - Full UKB training"
+
     figure.text(center, 1 - 3 / height, title, fontsize=7, ha="center", va="top")
     figure.legend(handles=[Patch(facecolor=color, label=label) for color, label in zip(compact_colors, compact_labels)],
                   loc="lower center", bbox_to_anchor=(center, 1.5 / height), ncol=5, frameon=False,
@@ -269,7 +290,11 @@ def draw_compact_benchmarks(data, comparisons, candidates, non_eur=False, scenar
             tests = comparisons.loc[comparisons.scenario.eq(key[0]) & comparisons.phenotype.eq(key[1])
                                     & comparisons.stratum.eq(key[2])]
             levels = int(tests.p_wald.lt(0.05).sum())
-            headroom = 0.04 + 0.20 * (levels - 1) + 0.015 + 0.18 if levels else 0.01
+            if levels:
+                headroom = 0.04 + 0.20 * (levels - 1) + 0.015 + 0.18
+            else:
+                headroom = 0.01
+
             top = float((group.value + group.err.fillna(0)).max())
             ymax = max(ymax, np.ceil(top / (1 - headroom) * 10) / 10)
 
@@ -287,14 +312,30 @@ def draw_compact_benchmarks(data, comparisons, candidates, non_eur=False, scenar
             figure.text(center, 1 - top / height, cohort_labels[compact_scenarios.index(scenario)],
                         fontsize=7.5, ha="center", va="top")
 
-        band_top = top + (4 if auroc else 3.5 if non_eur else 0)
+        if auroc:
+            band_top = top + 4
+        elif non_eur:
+            band_top = top + 3.5
+        else:
+            band_top = top + 0
+
         color = "#2f7f69" if family == "continuous" else "#b34860"
         figure.add_artist(Rectangle((left, 1 - (band_top + 3) / height), right - left, 3 / height,
                                     transform=figure.transFigure, facecolor=color, edgecolor="none"))
         figure.text(center, 1 - (band_top + 1.5) / height, family.title(), fontsize=5.7,
                     fontweight="semibold", color="white", ha="center", va="center")
-        groups = ["Sex-specific" if name.endswith("_SEX") else "Related-trait" if name.endswith("_MT")
-                  else "Multi-ancestry" for name in names]
+        groups = []
+
+        for name in names:
+            if name.endswith("_SEX"):
+                group_label = "Sex-specific"
+            elif name.endswith("_MT"):
+                group_label = "Related-trait"
+            else:
+                group_label = "Multi-ancestry"
+
+            groups.append(group_label)
+
         begin = 0
 
         for end in range(1, len(names) + 1):
@@ -330,7 +371,13 @@ def draw_compact_benchmarks(data, comparisons, candidates, non_eur=False, scenar
                             {"All": "Full", "EUR": "EUR", "non-EUR": "Non-EUR"}[stratum],
                             fontsize=5.4 if auroc else 6, ha="center", va="center", rotation=90)
 
-        ylabel = "AUROC" if auroc else r"Incremental $R^2$" if family == "continuous" else r"Nagelkerke $R^2$"
+        if auroc:
+            ylabel = "AUROC"
+        elif family == "continuous":
+            ylabel = r"Incremental $R^2$"
+        else:
+            ylabel = r"Nagelkerke $R^2$"
+
         figure.text(0.018, 1 - (top + header + plot_height / 2) / height, ylabel,
                     rotation=90, fontsize=6.4, ha="center", va="center")
 
@@ -439,8 +486,19 @@ def draw_matrix(figure, grid, data, label, title):
                                  va="center", ha="center")
 
     # Phenotype labels and source-panel headings sit above the matrix.
-    labels = [("Cont.\nscore" if name == "continuous" else "Binary\nscore")
-              if name in phenotypes else display_phenotype(name) for name in columns]
+    labels = []
+
+    for name in columns:
+        if name in phenotypes:
+            if name == "continuous":
+                tick_label = "Cont.\nscore"
+            else:
+                tick_label = "Binary\nscore"
+        else:
+            tick_label = display_phenotype(name)
+
+        labels.append(tick_label)
+
     matrix_axis.set_xticks(range(len(columns)), labels, rotation=55, ha="left",
                           va="bottom", rotation_mode="anchor", fontsize=5.4)
     matrix_axis.xaxis.tick_top()
@@ -588,8 +646,13 @@ def regional_heatmap(ax, panel, values, cmap, norm, fontsize=6):
     import numpy as np
     from matplotlib.collections import PolyCollection
 
-    vertices = [[(lo, row-.5), (hi, row-.5), (hi, row+.5), (lo, row+.5)]
-                for row in range(len(values)) for lo, hi in zip(panel["starts"], panel["ends"])]
+    vertices = []
+
+    # Adds every window rectangle for one source before moving to the next source.
+    for source_row in range(len(values)):
+        for lo, hi in zip(panel["starts"], panel["ends"]):
+            vertices.append([(lo, source_row-.5), (hi, source_row-.5),
+                             (hi, source_row+.5), (lo, source_row+.5)])
 
     # Row-major flattening matches the source-by-window order of the rectangles above.
     mesh = PolyCollection(vertices, array=values.ravel(), cmap=cmap, norm=norm, edgecolors="none")

@@ -37,9 +37,15 @@ def load_inputs(path):
     data = load_training_sizes(path)
     full = data.loc[data["size"].eq("full")]
     paired = full.pivot(index=["cohort", "phenotype"], columns="model", values="value")
-    eligible = paired.index[paired["Nonwindowed MultiPRS"].ge(.01) & paired["BLocPRS mb1"].notna()]
-    data = data.loc[pd.MultiIndex.from_frame(data[["cohort", "phenotype"]]).isin(eligible)].copy()
-    data = data.loc[~(data.cohort.eq("cartagene") & data.family.eq("binary") & data.cases.lt(100))]
+    usable_reference = paired["Nonwindowed MultiPRS"].ge(.01)
+    available_target = paired["BLocPRS mb1"].notna()
+    eligible = paired.index[usable_reference & available_target]
+    cohort_phenotype = pd.MultiIndex.from_frame(data[["cohort", "phenotype"]])
+    data = data.loc[cohort_phenotype.isin(eligible)].copy()
+
+    # Applies the transfer case-count rule after full-training eligibility.
+    sparse_transfer = data.cohort.eq("cartagene") & data.family.eq("binary") & data.cases.lt(100)
+    data = data.loc[~sparse_transfer]
     data["Cohort"] = data.cohort.map(dict(zip(["ukbb", "cartagene"], cohorts)))
 
     return data.rename(columns={"family": "Family", "phenotype": "Phenotype", "size": "N train",

@@ -76,7 +76,11 @@ def summarize_ablation(metrics):
         for column in ("value", "recovery"):
             values = group[column].to_numpy(dtype=float)
             complete = np.isfinite(values).all()
-            quantiles = np.quantile(values, [.025, .25, .5, .75, .975]) if complete else [np.nan] * 5
+            if complete:
+                quantiles = np.quantile(values, [.025, .25, .5, .75, .975])
+            else:
+                quantiles = [np.nan] * 5
+
             row[f"{column}_mean"] = float(values.mean()) if complete else np.nan
             row.update({f"{column}_{name}": value for name, value in
                         zip(("q025", "q25", "median", "q75", "q975"), quantiles)})
@@ -198,7 +202,11 @@ def evaluate_ablation(model, data, windows, *, fractions=FRACTIONS, n_random=100
     metrics["delta_anchor"], metrics["delta_full"] = metrics.value - anchor_value, metrics.value - full_value
 
     # Negative gains and recovery outside [0, 1] are retained without clipping.
-    metrics["recovery"] = metrics.delta_anchor / gain if np.isfinite(gain) and abs(gain) > 1e-12 else np.nan
+    if np.isfinite(gain) and abs(gain) > 1e-12:
+        metrics["recovery"] = metrics.delta_anchor / gain
+    else:
+        metrics["recovery"] = np.nan
+
     summary = summarize_ablation(metrics)
 
     for table in (metrics, summary):
@@ -326,18 +334,21 @@ def compute_gwas_concentration(gwas_files, windows, *, fractions=FRACTIONS):
         group = group.copy()
         starts, ends = group.start_bp.to_numpy(), group.end_bp.to_numpy()
         maxima, variants = np.zeros(len(group)), np.zeros(len(group), dtype=np.int64)
-        before = counts["n_valid_variants"]
 
         # Position assignment uses inclusive window bounds and retains each window's peak signal.
         for positions, logp in gwas_chunks(gwas_files[chromosome], chromosome, counts):
             indices = np.searchsorted(starts, positions, side="right") - 1
             covered = indices >= 0
+
+            # Checks end coordinates only for positions at or after the first window start.
             covered[covered] &= positions[covered] <= ends[indices[covered]]
+
+            # Accumulates every variant, including multiple variants assigned to the same window.
             np.add.at(variants, indices[covered], 1)
             np.maximum.at(maxima, indices[covered], logp[covered])
             counts["n_unmapped_variants"] += int((~covered).sum())
 
-        if counts["n_valid_variants"] == before or not variants.sum():
+        if not variants.sum():
             raise ValueError(f"No successful additive tests map to modeled windows on chromosome {chromosome}.")
 
         group["n_valid_variants"], group["max_logp"] = variants, maxima
@@ -383,7 +394,8 @@ def load_context(directory, model=None):
         names = context.window.drop_duplicates().tolist()
 
     # Coefficient magnitudes and training SDs reconstruct the saved ranking.
-    activity = (context.eta_centered.abs() * context.model_prs_sd).groupby(context.window, sort=False).sum()
+    activity = context.eta_centered.abs() * context.model_prs_sd
+    activity = activity.groupby(context.window, sort=False).sum()
     ordered = windows.set_index("window", verify_integrity=True).loc[names]
 
     if (set(activity.index) != set(windows.window)

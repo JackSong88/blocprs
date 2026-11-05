@@ -41,8 +41,7 @@ def prepare_data(dataset, family, validation_size=50000, seed=42, validation_ids
 
     if validation_ids is None:
 
-        if not 0 < validation_size < len(y):
-            raise ValueError("Validation size must leave participants for both fitting and selection.")
+        assert 0 < validation_size < len(y)
 
         # Stratified sampling preserves case/control balance in binary validation rows.
         validation_rows = _subsample_indices(y, validation_size, np.random.RandomState(seed),

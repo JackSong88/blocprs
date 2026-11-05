@@ -41,7 +41,10 @@ def liftover_weights(weights):
 
     for index, row in enumerate(weights.itertuples(index=False)):
         try:
-            matches = set(converter[str(row.chr_name).removeprefix("chr")][int(row.chr_position)])
+            chromosome = str(row.chr_name).removeprefix("chr")
+            chromosome_map = converter[chromosome]
+            position = int(row.chr_position)
+            matches = set(chromosome_map[position])
         except KeyError:
             matches = set()
 

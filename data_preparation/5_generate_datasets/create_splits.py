@@ -1,4 +1,9 @@
-"""Create one participant split for genome-wide and windowed PRS datasets."""
+"""Creates one training/test split for genome-wide and windowed PRS datasets.
+
+Requires the score inputs to cover the same participants with complete phenotype
+and covariate records. Saves train_ids.txt and test_ids.txt so dataset creation
+uses the same people and split order for both score representations.
+"""
 
 import argparse
 from pathlib import Path
@@ -17,7 +22,7 @@ def create_splits(scores_files, phenotype_file, covariates_file, ancestry_file, 
     assert num_pcs >= 0
     assert scores_files
 
-    # Establish the same eligible population across all score representations.
+    # Selects complete phenotype/covariate records before matching the score IDs.
     metadata, _ = read_metadata(phenotype_file, covariates_file, ancestry_file, num_pcs, family)
     eligible = None
     missing_scores = 0
@@ -28,6 +33,7 @@ def create_splits(scores_files, phenotype_file, covariates_file, ancestry_file, 
         # Sorts IDs so input-file order cannot change the random split.
         selected = selected.sort_index()
 
+        # Requires identical eligible IDs rather than silently dropping people from one input.
         if eligible is None:
             eligible, missing_scores = selected, missing
         elif not selected.index.equals(eligible.index):
@@ -41,7 +47,7 @@ def create_splits(scores_files, phenotype_file, covariates_file, ancestry_file, 
     if family == "binomial" and set(eligible.iloc[train_rows]["phenotype"]) != {0, 1}:
         raise ValueError("Binary training data must contain both cases and controls.")
 
-    # groups training and test participants and labels their split.
+    # Groups training and test IDs for the two reusable split files.
     split = eligible.iloc[np.concatenate([train_rows, test_rows])].copy()
     split["split"] = ["train"] * len(train_rows) + ["test"] * len(test_rows)
     output_dir = Path(output_dir)

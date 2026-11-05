@@ -16,7 +16,7 @@ dependencies = ["numpy", "scipy", "pandas", "scikit-learn", "statsmodels", "jobl
 [project.optional-dependencies]
 mtl-prs = ["pgenlib==0.94.1", "numba"]
 
-[tool.setuptools.packages.find]
-where = ["model"]
-include = ["blocprs", "blocprs.*"]
-namespaces = false
+[tool.setuptools]
+packages = ["blocprs"]
+py-modules = ["participant_utils"]
+package-dir = { blocprs = "model/blocprs" }

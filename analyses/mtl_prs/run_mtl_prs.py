@@ -58,7 +58,9 @@ def prepare_run(args):
 # Mixture fitting selects raw-score weights on update-training rows and calibrates the selected mixture.
 def fit_mixture(run, prepared):
     rows = prepared["update_rows"]
-    y, covariates, scores = (prepared[name][rows] for name in ("y", "covariates", "scores"))
+    y = prepared["y"][rows]
+    covariates = prepared["covariates"][rows]
+    scores = prepared["scores"][rows]
 
     # Five-fold CV selects the source mixture; calibration uses all update rows.
     pi, candidates = select_mixture(y, scores, covariates, prepared["source_names"],

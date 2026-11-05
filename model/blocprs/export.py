@@ -62,7 +62,8 @@ def _model_arrays(model):
     if np.any(source_sd <= 0):
         raise ValueError("Source scales must be strictly positive.")
 
-    # c_eff = gamma + eta_centered; division by training SD gives raw-score weights.
+    # eta_centered_wk = eta_wk - mean_w(eta_wk); c_eff_wk = gamma_k + eta_centered_wk.
+    # c_eff_wk / sigma_k multiplies raw S_tilde_iwk, using training source SDs.
     centered = eta - eta.mean(axis=0, keepdims=True)
     effective = gamma[None, :] + centered
     multipliers = effective / source_sd[None, :]
@@ -73,8 +74,8 @@ def _model_arrays(model):
     return sources, windows, gamma, eta, window_mean, centered, effective, multipliers
 
 
-# Returns genetic coefficients in fitted order, excluding intercept and covariates.
-# The table contains multipliers; export_snp_weights returns the centering offset.
+# Returns gamma_k, eta_wk, eta_centered_wk, c_eff_wk and raw multipliers in fitted order.
+# Excludes alpha_0 and alpha_c; export_snp_weights supplies the additive genetic offset.
 def regional_coefficients(model) -> pd.DataFrame:
     sources, windows, gamma, eta, _, centered, effective, multipliers = _model_arrays(model)
     return pd.DataFrame({
@@ -93,8 +94,8 @@ class SNPWeights:
     """Combined SNP effect estimates, additive genetic offset and genome build.
 
     With the original scoring conventions and matching effect-allele dosages,
-    ``dosages @ weights.weight + offset`` reconstructs the genetic score up to
-    rounding differences. It excludes the model intercept and covariate effects.
+    ``dosages @ weights.weight + offset`` reconstructs s_i in model units, up to
+    rounding differences. It excludes alpha_0 and covariate effects alpha_c.
     For binary models this is the genetic part of the logit, not a probability.
     The offset includes training centering and any allele-orientation constants.
     """
@@ -186,13 +187,7 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
     if not source_weights.columns.is_unique:
         raise ValueError("source_weights contains duplicate column names.")
 
-    missing = [column for column in columns if column not in source_weights]
-
-    if missing:
-        raise ValueError(f"source_weights is missing required columns: {missing}")
-
-    if source_weights.empty:
-        raise ValueError("source_weights must contain the complete matched score panel.")
+    assert not source_weights.empty
 
     extra = ["allele_offset"] if "allele_offset" in source_weights else []
     frame = source_weights.loc[:, columns + extra].copy()
@@ -253,7 +248,7 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
     if np.any((~present) & (window_mean != 0)):
         raise ValueError("A missing source/window pair has a nonzero saved score mean; the panel is incomplete.")
 
-    # Applies each source/window multiplier before combining sources for the same SNP.
+    # Multiplies each raw source SNP weight by c_eff_wk / sigma_k, then sums sources.
     # sort=False keeps the first-seen variant order rather than sorting IDs.
     frame["weight"] = frame["weight"].to_numpy() * multipliers[w, k]
     combined = frame.groupby("variant_id", sort=False)["weight"].sum()
@@ -264,8 +259,8 @@ def export_snp_weights(model, source_weights: pd.DataFrame, path: str | Path | N
         "other_allele", "weight", "genome_build", "window",
     ]].reset_index(drop=True)
 
-    # Computes the offset for training-score centering and allele-reversal constants.
-    # Raw dosage scoring has no centering step, so the saved offset supplies it.
+    # Training centering contributes -sum_wk(mu_wk * c_eff_wk / sigma_k).
+    # Allele-reversal constants are added below; neither alpha_0 nor alpha_c is exported.
     offset = -float(np.sum(multipliers * window_mean))
 
     if allele_offset is not None:

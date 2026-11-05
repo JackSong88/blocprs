@@ -43,6 +43,7 @@ cohort_dir=$(realpath -m "${4:-$root/data/$cohort}")
 # Stores pipeline downloads and container images under the project directory.
 export NXF_HOME="$root/data/nextflow"
 export NXF_VER=25.10.0
+export NXF_OFFLINE=true
 export NXF_SINGULARITY_CACHEDIR="$root/data/containers"
 export NXF_OPTS='-Xms1G -Xmx16G'
 export APPTAINER_CACHEDIR="$root/data/containers/cache"

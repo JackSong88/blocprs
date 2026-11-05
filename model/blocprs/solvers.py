@@ -1,8 +1,7 @@
 """Penalized linear and logistic regression for BLocPRS.
 
-Ridge regularization acts on regional coefficients; the intercept, covariate
-effects and genome-wide source coefficients remain unpenalized. Model inputs
-are processed in participant blocks to limit memory use.
+Ridge regularization acts on eta_wk; alpha_0, alpha_c and gamma_k remain
+unpenalized. Model inputs are processed in participant blocks to limit memory use.
 """
 
 from collections import deque
@@ -52,17 +51,14 @@ class GaussianStatistics:
 def _penalty(design, lambda_, n_unpenalized):
     p = design.n_features
 
-    if (isinstance(n_unpenalized, (bool, np.bool_))
-        or not isinstance(n_unpenalized, (int, np.integer))
-        or not 1 <= n_unpenalized <= p):
-        raise ValueError("Invalid number of unpenalized coefficients.")
+    assert (not isinstance(n_unpenalized, (bool, np.bool_))
+            and isinstance(n_unpenalized, (int, np.integer)) and 1 <= n_unpenalized <= p)
 
     lambda_ = float(lambda_)
 
-    if not np.isfinite(lambda_) or lambda_ < 0:
-        raise ValueError("Regional penalty must be finite and nonnegative.")
+    assert np.isfinite(lambda_) and lambda_ >= 0
 
-    # Leaves the intercept, covariates, and global source effects unpenalized.
+    # Leaves alpha_0, alpha_c and gamma_k unpenalized; lambda applies to eta_wk.
     penalty = np.zeros(p, dtype=np.float64)
     penalty[n_unpenalized:] = lambda_
 
@@ -75,8 +71,7 @@ def _blocks(design):
     seen = 0
 
     for X, y in design.iter_blocks():
-        if y is None:
-            raise ValueError("Fitting requires outcomes.")
+        assert y is not None
 
         X, y = np.asarray(X, dtype=np.float64), np.asarray(y, dtype=np.float64)
 
@@ -146,13 +141,13 @@ def _objective_gradient(design, coef, penalty, family):
             gradient += X.T @ residual
         else:
 
-            # logaddexp evaluates the logistic loss without exponentiating large logits.
+            # Binary loss: log(1 + exp(ell_i)) - y_i * ell_i; logaddexp avoids overflow.
             loss += float(np.sum(np.logaddexp(0.0, linear_predictor) - y * linear_predictor))
 
-            # expit is the sigmoid; predicted probabilities minus y give the loss gradient.
+            # expit(ell_i) is P(y_i=1); probabilities minus y give the loss gradient.
             gradient += X.T @ (expit(linear_predictor) - y)
 
-    # Averages the data loss and adds lambda / 2 * ||eta||^2 only once.
+    # Averages the data loss and adds lambda / 2 * sum_wk(eta_wk**2) only once.
     loss = loss / n + 0.5 * float(np.sum(penalty * coef * coef))
     gradient = gradient / n + penalty * coef
 
@@ -219,8 +214,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
     assert not isinstance(workers, (bool, np.bool_)) and isinstance(workers, (int, np.integer)) and workers >= 1
 
     if family == "gaussian":
-        if initial is not None:
-            raise ValueError("Gaussian fitting does not use initial coefficients.")
+        assert initial is None
 
         stats = continuous_statistics(design) if statistics is None else statistics
 
@@ -264,8 +258,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
 
         return FitResult(coef, objective, True, 1, message)
 
-    if statistics is not None:
-        raise ValueError("Gaussian cross-products cannot be used for logistic fitting.")
+    assert statistics is None
 
     # Validates outcomes once per immutable design, without reading the PRS matrix.
     cases = getattr(design, "_binary_cases", None)
@@ -295,8 +288,7 @@ def fit(design, family, lambda_, n_unpenalized, initial=None, statistics=None, w
 
         start = initial.copy()
 
-    if workers > 1 and not callable(getattr(design, "read_block", None)):
-        raise ValueError("Parallel logistic fitting requires a cached design.")
+    assert workers <= 1 or callable(getattr(design, "read_block", None)), "Parallel fitting requires a cached design."
 
     # Closes workers before restoring BLAS limits, including when fitting fails.
     with ExitStack() as stack:

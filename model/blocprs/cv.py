@@ -1,7 +1,7 @@
-"""Cross-validated selection of the regional regularization parameter.
+"""Cross-validated selection of the regularization parameter for eta_wk.
 
-Genetic coefficients are estimated on training folds and evaluated on
-validation folds using covariate-adjusted R^2.
+gamma_k and eta_wk are estimated on training folds. Their fixed genetic
+scores s_i are evaluated on validation folds using covariate-adjusted R^2.
 """
 
 from contextlib import ExitStack
@@ -33,29 +33,33 @@ def _subsample_indices(y, total_used, rng, stratify=False, min_per_class=1):
     if not stratify:
         return rng.permutation(all_idx)[:total_used]
 
-    classes, inverse = np.unique(y, return_inverse=True)
+    class_indices = [
+        np.flatnonzero(y == 0),
+        np.flatnonzero(y == 1),
+    ]
+    counts = np.array([len(indices) for indices in class_indices], dtype=np.int64)
 
-    if len(classes) < 2:
-        raise ValueError("Binary CV requires both outcome classes.")
-
-    class_indices = [np.flatnonzero(inverse == i) for i in range(len(classes))]
-    counts = np.array([len(idx) for idx in class_indices], dtype=np.int64)
+    if np.any(counts == 0) or counts.sum() != n_samples:
+        raise ValueError("Binary CV requires outcomes coded 0 and 1, with both classes present.")
 
     # Allocates proportional class counts, bounded by the available rows.
     expected = total_used * counts.astype(np.float64) / float(n_samples)
     desired = np.floor(expected).astype(np.int64)
     min_counts = np.minimum(counts, max(int(min_per_class), 1))
 
-    if int(min_counts.sum()) <= total_used:
-        desired = np.maximum(desired, min_counts)
+    assert np.all(counts >= min_per_class), "Too few cases or controls for CV."
+    assert total_used >= 2 * min_per_class, "CV subset cannot accommodate both class minimums."
 
-    desired = np.minimum(desired, counts)
+    desired = np.minimum(np.maximum(desired, min_counts), counts)
 
     # Corrects rounding to reach the exact sample size without exceeding class bounds.
     current = int(desired.sum())
     fractions = expected - np.floor(expected)
 
+    # Add/subtract back after flooring/rounding, if needed.
     if current < total_used:
+
+        # Adds remaining places to classes with the largest fractional remainders.
         order = np.argsort(-fractions)
 
         while current < total_used:
@@ -73,14 +77,15 @@ def _subsample_indices(y, total_used, rng, stratify=False, min_per_class=1):
             if not changed:
                 raise ValueError("Could not allocate the requested CV sample.")
     elif current > total_used:
-        lower = min_counts if int(min_counts.sum()) <= total_used else np.zeros_like(desired)
+
+        # Removes excess places without taking either class below its minimum.
         order = np.argsort(fractions)
 
         while current > total_used:
             changed = False
 
             for index in order:
-                if desired[index] > lower[index]:
+                if desired[index] > min_counts[index]:
                     desired[index] -= 1
                     current -= 1
                     changed = True
@@ -91,11 +96,18 @@ def _subsample_indices(y, total_used, rng, stratify=False, min_per_class=1):
             if not changed:
                 raise ValueError("Could not allocate the requested CV sample.")
 
-    sampled = np.concatenate([rng.permutation(indices)[:int(count)]
-                              for indices, count in zip(class_indices, desired) if count > 0])
+    # Shuffles each class once and takes its allocated number of participants.
+    selected_groups = []
+
+    for indices, count in zip(class_indices, desired):
+        if count > 0:
+            shuffled = rng.permutation(indices)
+            selected_groups.append(shuffled[:int(count)])
+
+    sampled = np.concatenate(selected_groups)
     rng.shuffle(sampled)
 
-    return sampled[:total_used]
+    return sampled
 
 
 # Checks that an integer count meets the specified minimum.
@@ -106,7 +118,7 @@ def _positive_integer(value, name, minimum=1):
     return int(value)
 
 
-# Predicts genetic effects only, excluding the fitted intercept and covariates.
+# Computes s_i = sum_k gamma_k S_ik + sum_wk eta_wk Z_iwk, excluding covariate effects.
 def _genetic_predictions(design, coef):
     first_genetic = 1 + design.n_covariates
     prediction = np.empty(design.n_samples, dtype=np.float64)
@@ -117,8 +129,8 @@ def _genetic_predictions(design, coef):
         prediction[offset:stop] = X[:, first_genetic:] @ coef[first_genetic:]
         offset = stop
 
-    if offset != len(prediction) or not np.isfinite(prediction).all():
-        raise ValueError("Invalid validation genetic predictions.")
+    if offset != len(prediction):
+        raise ValueError("Validation predictions do not cover every participant.")
 
     return prediction
 
@@ -131,12 +143,12 @@ def _fit_fold(data, family, candidates, train_rows, val_rows, fold_index, block_
 
     with threadpool_limits(limits=1), ExitStack() as stack:
 
-        # Fits this fold's scaler before caching its transformed inputs.
+        # Learns mu_wk and sigma_k on fold-training rows before transforming either fold.
         scaler = Scaler.fit(data, family, block_size, rows=train_rows)
         train = Design(data, scaler, rows=train_rows, block_size=block_size)
         validation = Design(data, scaler, rows=val_rows, block_size=block_size)
 
-        # Refits evaluation regressions on validation rows, keeping PRS weights fixed.
+        # Evaluation regresses y on covariates with/without s_i; gamma_k and eta_wk stay fixed.
         metric_type = NagelkerkeR2 if family == "binomial" else IncrementalR2
 
         try:
@@ -144,15 +156,25 @@ def _fit_fold(data, family, candidates, train_rows, val_rows, fold_index, block_
         except Exception as exc:
             raise ValueError(f"CV fold {fold_index + 1}: auxiliary null fit failed: {exc}") from exc
 
+        # Caches transformed validation inputs for reuse across penalties.
+        # The stack removes the cache when this fold finishes or fails.
         validation = stack.enter_context(cached_design(validation, cache_dir, f"fold_{fold_index + 1}_validation"))
 
         if family == "binomial":
+
+            # Caches training inputs because logistic optimization reads them repeatedly.
             train = stack.enter_context(cached_design(train, cache_dir, f"fold_{fold_index + 1}_train"))
 
-        # Reuses cross-products for Gaussian fits and the previous optimum for binary fits.
+        # Computes X.T @ X and X.T @ y once for reuse across Gaussian penalties.
         statistics = continuous_statistics(train) if family == "gaussian" else None
+
+        # Leaves the intercept, covariate effects and genome-wide source weights unpenalized.
         n_unpenalized = 1 + train.n_covariates + len(data.source_names)
+
+        # Starts without fitted coefficients; later binary fits start from the previous solution.
         initial = None
+
+        # Collects this fold's validation score for each penalty.
         scores = []
 
         for number, penalty in enumerate(candidates, 1):
@@ -162,9 +184,12 @@ def _fit_fold(data, family, candidates, train_rows, val_rows, fold_index, block_
             except Exception as exc:
                 raise ValueError(f"CV fold {fold_index + 1}, lambda={penalty:g}: {exc}") from exc
 
+            # Records this penalty's validation score for averaging across folds.
             scores.append(score)
 
             if family == "binomial":
+
+                # Warm-starts the next penalty from this fit's coefficients.
                 initial = fitted.coef
 
             if number == 1 or number % 5 == 0 or number == len(candidates):
@@ -195,6 +220,7 @@ def select_lambda(data, family, lambda_grid, *, cv_folds=5, cv_max_samples=50000
         raise ValueError("lambda_grid must contain distinct finite nonnegative values.")
 
     # Starts binary fits at larger penalties, then reuses coefficients within each fold.
+    # Warm-start path-wise algorithm
     if family == "binomial":
         candidates = np.sort(candidates)[::-1]
 
@@ -208,8 +234,7 @@ def select_lambda(data, family, lambda_grid, *, cv_folds=5, cv_max_samples=50000
     # Rounds down so each validation fold has the same number of rows.
     total_used = (available // cv_folds) * cv_folds
 
-    if total_used < cv_folds:
-        raise ValueError("Too few training participants for the requested CV folds.")
+    assert total_used >= cv_folds
 
     sampled = _subsample_indices(y, total_used, np.random.RandomState(random_state),
                                 stratify=family == "binomial", min_per_class=cv_folds)
@@ -230,7 +255,8 @@ def select_lambda(data, family, lambda_grid, *, cv_folds=5, cv_max_samples=50000
     logger.info("CV: %s participants, %s folds, %s penalties, %s workers",
                 total_used, cv_folds, len(candidates), cv_workers)
 
-    # Caches raw sampled rows once; each worker fits its own training-fold scaler.
+    # Estimates temporary disk space for shared raw scores and concurrent fold caches.
+    # Binary folds cache training and validation designs; Gaussian folds cache validation only.
     n_features = 1 + data.n_covariates + data.n_sources * (1 + data.n_windows)
     raw_bytes = total_used * data.n_windows * data.n_sources * data.window_scores.dtype.itemsize
     cached_rows = total_used if family == "binomial" else total_used // cv_folds
@@ -249,14 +275,20 @@ def select_lambda(data, family, lambda_grid, *, cv_folds=5, cv_max_samples=50000
                     logger.info("CV fold %s/%s complete", number + 1, cv_folds)
             else:
 
+                # Parallel across folds
                 # Shares raw score maps; each fold keeps its own transformed cache.
-                # Uses one numerical thread per worker.
                 with parallel_config(backend="loky", inner_max_num_threads=1):
                     with Parallel(n_jobs=cv_workers, batch_size=1, pre_dispatch=cv_workers,
                                   return_as="generator", max_nbytes="1M", mmap_mode="r") as pool:
-                        completed = pool(delayed(_fit_fold)(staged, family, candidates, train_rows,
-                                                            val_rows, number, block_size, directory, log_level)
-                                         for number, (train_rows, val_rows) in enumerate(folds))
+                        # Prepares one deferred fitting task per fold; the pool runs them.
+                        tasks = []
+
+                        for number, (train_rows, val_rows) in enumerate(folds):
+                            task = delayed(_fit_fold)(staged, family, candidates, train_rows,
+                                                      val_rows, number, block_size, directory, log_level)
+                            tasks.append(task)
+
+                        completed = pool(tasks)
                         fold_scores = []
 
                         for scores in completed:

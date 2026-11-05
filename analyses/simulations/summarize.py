@@ -53,7 +53,8 @@ def validate_results(data, selected_panels, replicates):
     gap = data.simulation_truth - data.true_genomewide_component
     null = data.architecture.eq("A0")
     usable = ~null & gap.abs().gt(1e-12)
-    status = np.where(null, "not_applicable_A0", np.where(usable, "ok", "zero_truth_gap"))
+    status = np.where(usable, "ok", "zero_truth_gap")
+    status = np.where(null, "not_applicable_A0", status)
 
     if not np.allclose(gap.loc[null], 0, rtol=0, atol=1e-12) or not data.recovery_status.eq(status).all():
         raise ValueError("Inconsistent true regional gap or recovery status")
@@ -112,13 +113,19 @@ def summarize_results(data):
             values = group[column].to_numpy(dtype=float)
             n = int(np.isfinite(values).sum())
             complete = n == len(values)
+            mean = float(values.mean()) if complete else np.nan
 
             # SEM is across simulation replicates, not participant bootstrap uncertainty.
+            if complete and n > 1:
+                sem = float(values.std(ddof=1) / np.sqrt(n))
+            else:
+                sem = np.nan
+
             rows.append({
                 "panel": panel, "base_panel": base_panel, "architecture": architecture,
                 "Metric": metric, "endpoint": endpoint, "method": method,
-                "mean": float(values.mean()) if complete else np.nan,
-                "sem": float(values.std(ddof=1) / np.sqrt(n)) if complete and n > 1 else np.nan,
+                "mean": mean,
+                "sem": sem,
                 "n": n, "n_total": len(values),
             })
 

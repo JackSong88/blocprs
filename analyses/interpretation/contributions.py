@@ -94,7 +94,10 @@ def iter_components(model, data, block_size=1024):
 
 # Coordinate lookup matches canonical global window IDs to the model's ordered feature names.
 def window_coordinates(window_map, names):
-    table = pd.read_csv(window_map, sep="\t") if not isinstance(window_map, pd.DataFrame) else window_map.copy()
+    if isinstance(window_map, pd.DataFrame):
+        table = window_map.copy()
+    else:
+        table = pd.read_csv(window_map, sep="\t")
 
     if "window" not in table:
         table["window"] = [f"w{int(value):04d}" for value in table.window_id_global]
@@ -199,7 +202,10 @@ def compute_contributions(model, data, window_map, phenotype, block_size=1024):
     coordinates = window_coordinates(window_map, model.window_names_)
     widths = coordinates.end_bp - coordinates.start_bp + 1
     width = int(widths.iloc[0])
-    window_size = f"mb{width // 1000000}" if widths.eq(width).all() and width % 1000000 == 0 else "custom"
+    if widths.eq(width).all() and width % 1000000 == 0:
+        window_size = f"mb{width // 1000000}"
+    else:
+        window_size = "custom"
 
     # The context table associates each window/source coefficient with training SDs and genomic coordinates.
     context = regional_coefficients(model).rename(columns={"source": "base"})
@@ -238,7 +244,11 @@ def compute_contributions(model, data, window_map, phenotype, block_size=1024):
         windows[f"Cov_{name}"] = moments.covariance
 
         # Cov(window, total) / Var(total) is signed and includes cross-window dependence.
-        windows[f"q_{name}"] = moments.covariance / moments.total_variance if moments.total_variance > floor else np.nan
+        if moments.total_variance > floor:
+            windows[f"q_{name}"] = moments.covariance / moments.total_variance
+        else:
+            windows[f"q_{name}"] = np.nan
+
         windows[f"V_diag_{name}"], windows[f"V_net_{name}"] = diagonal, moments.variance
 
         # The difference retains covariance between source contributions within this window.
@@ -246,8 +256,10 @@ def compute_contributions(model, data, window_map, phenotype, block_size=1024):
         windows[f"net_diag_ratio_{name}"] = np.divide(moments.variance, diagonal,
                                                      out=np.full_like(diagonal, np.nan), where=diagonal > 0)
 
-    windows["q_D_to_P"] = (stats["D_to_P"].covariance / stats["P"].total_variance
-                            if stats["P"].total_variance > floor else np.nan)
+    if stats["P"].total_variance > floor:
+        windows["q_D_to_P"] = stats["D_to_P"].covariance / stats["P"].total_variance
+    else:
+        windows["q_D_to_P"] = np.nan
 
     return context, windows
 

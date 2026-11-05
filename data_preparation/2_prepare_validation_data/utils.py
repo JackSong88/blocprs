@@ -29,13 +29,14 @@ def prepare_fev1_fvc_ratio(fev1, fvc, stratify=None, sigma_threshold=3):
     fev1 = pd.to_numeric(pd.Series(fev1, copy=True).reset_index(drop=True), errors="coerce")
     fvc = pd.to_numeric(pd.Series(fvc, copy=True).reset_index(drop=True), errors="coerce")
 
-    if len(fev1) != len(fvc):
-        raise ValueError("FEV1 and FVC must contain the same number of participants.")
+    assert len(fev1) == len(fvc)
 
-    strata = None if stratify is None else pd.Series(stratify, copy=True).reset_index(drop=True)
+    if stratify is None:
+        strata = None
+    else:
+        strata = pd.Series(stratify, copy=True).reset_index(drop=True)
 
-    if strata is not None and len(strata) != len(fev1):
-        raise ValueError("Sex strata must match the number of participants.")
+    assert strata is None or len(strata) == len(fev1)
 
     # Log-space QC requires finite, positive lung volumes.
     fev1 = fev1.where(np.isfinite(fev1) & fev1.gt(0))

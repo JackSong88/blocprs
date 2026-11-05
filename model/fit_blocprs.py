@@ -51,7 +51,7 @@ def main(argv=None):
         assert args.cv_workers == 1
         assert args.fit_workers == 1 and args.cache_dir is None
 
-    # Loads the training participants and optional single-source panel.
+    # Loads raw S_tilde_iwk for training participants and the optional single-source panel.
     logging.info("Loading training dataset: %s", args.dataset)
     data = load_dataset(args.dataset, split="train", ids_file=args.train_ids)
 
@@ -64,9 +64,13 @@ def main(argv=None):
     assert (args.model == "fixed-composition") == (args.genomewide_dataset is not None)
 
     # Sets up full BLocPRS or the fixed-composition comparator.
-    model_class = FixedCompositionBLocPRS if args.model == "fixed-composition" else BLocPRS
-    options = ({"cv_workers": args.cv_workers, "fit_workers": args.fit_workers, "cache_dir": args.cache_dir}
-               if args.model == "blocprs" else {})
+    if args.model == "fixed-composition":
+        model_class = FixedCompositionBLocPRS
+        options = {}
+    else:
+        model_class = BLocPRS
+        options = {"cv_workers": args.cv_workers, "fit_workers": args.fit_workers, "cache_dir": args.cache_dir}
+
     model = model_class(family=args.family, lambda_=args.lambda_, cv_folds=args.cv_folds,
                         cv_max_samples=args.cv_max_samples, random_state=args.seed,
                         block_size=args.block_size, **options)
@@ -83,7 +87,7 @@ def main(argv=None):
     else:
         model.fit(data)
 
-    # Saves coefficients and training scaling together.
+    # Saves gamma_k, eta_wk, covariate coefficients and training scaling together.
     args.output.parent.mkdir(parents=True, exist_ok=True)
     model.save(args.output)
     logging.info("Saved model: %s; elapsed=%.1fs", args.output, monotonic() - started)

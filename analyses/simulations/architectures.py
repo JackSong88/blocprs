@@ -315,9 +315,9 @@ def _smallest_lambda(covariance, genomewide_covariance, gamma0, shifts,
     def ratio(strength):
         weights = np.minimum(strength * rates, limits)
         gamma = gamma0 + shifts.T @ weights
-        return float(weights @ covariance @ weights) / float(
-            gamma @ genomewide_covariance @ gamma
-        )
+        regional_variance = float(weights @ covariance @ weights)
+        genomewide_variance = float(gamma @ genomewide_covariance @ gamma)
+        return regional_variance / genomewide_variance
 
     candidates = [point for point in boundaries
                   if np.isclose(ratio(point), target, rtol=1e-9, atol=1e-12)]
@@ -409,8 +409,7 @@ def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
     rank-aware orthonormal nuisance basis may be provided as design.basis.
     """
 
-    if architecture not in {"A0", "A1", "A2"}:
-        raise ValueError("Primary architectures are A0, A1, and A2")
+    assert architecture in {"A0", "A1", "A2"}
 
     if design.n_sources < 2 or design.n_windows < 2:
         raise ValueError("Simulation requires at least two sources and windows")
@@ -465,9 +464,11 @@ def build_truth(design, architecture, seed=20260722, replicate=0, panel=0):
             raise InfeasibleTruthError("Final A2 coefficients violate their declared bounds")
 
     # Post-calibration checks verify final strength and coefficient identity.
-    achieved = 0.0 if architecture == "A0" else _unique_variance(
-        design.regional(eta), basis
-    ) / float(np.var(design.genomewide @ gamma))
+    if architecture == "A0":
+        achieved = 0.0
+    else:
+        achieved = _unique_variance(design.regional(eta), basis) / float(np.var(design.genomewide @ gamma))
+
     target = {"A0": 0.0, "A1": 0.02, "A2": 0.10}[architecture]
 
     if not np.isclose(achieved, target, rtol=1e-6, atol=1e-10):
